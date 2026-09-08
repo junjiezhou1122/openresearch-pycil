@@ -39,18 +39,24 @@ if [ ! -d "data/cifar-100-python" ]; then
     tar -xzf "data/cifar-100-python.tar.gz" -C data
 fi
 
-# --- evaluator: fetch from pinned FML commit and verify identity ---
-if [ -f "train_eval_baseline.py" ]; then
-    ACTUAL_EVAL_SHA=$(sha256sum train_eval_baseline.py | cut -d' ' -f1)
-    if [ "$ACTUAL_EVAL_SHA" != "$EVALUATOR_SHA256" ]; then
-        echo "FATAL: evaluator hash mismatch: got $ACTUAL_EVAL_SHA want $EVALUATOR_SHA256" >&2
-        exit 5
-    fi
+# --- evaluator: pinned identity, server cache first, network fallback ---
+# The pinned sha256 below is the frozen identity (protocol §1); a file is used
+# only if it matches exactly. Cache-first avoids flaky raw.githubusercontent
+# fetches; the network path is the fallback with retries. Any mismatch is fatal.
+EVAL_CACHE="${EVAL_CACHE:-/home/zhoujunjie/openresearch-evaluator/train_eval_baseline.py}"
+fetch_evaluator() {
+    curl -s --retry 5 --retry-delay 3 --max-time 60 -o train_eval_baseline.py "$EVALUATOR_URL"
+}
+check_evaluator() { [ "$(sha256sum "$1" | cut -d' ' -f1)" = "$EVALUATOR_SHA256" ]; }
+
+if check_evaluator "$EVAL_CACHE"; then
+    cp "$EVAL_CACHE" train_eval_baseline.py
+elif [ -f train_eval_baseline.py ] && check_evaluator train_eval_baseline.py; then
+    : # already present and correct
 else
-    curl -s --max-time 60 -o train_eval_baseline.py "$EVALUATOR_URL"
-    ACTUAL_EVAL_SHA=$(sha256sum train_eval_baseline.py | cut -d' ' -f1)
-    if [ "$ACTUAL_EVAL_SHA" != "$EVALUATOR_SHA256" ]; then
-        echo "FATAL: evaluator download hash mismatch: got $ACTUAL_EVAL_SHA want $EVALUATOR_SHA256" >&2
+    fetch_evaluator
+    if [ ! -s train_eval_baseline.py ] || ! check_evaluator train_eval_baseline.py; then
+        echo "FATAL: evaluator could not be sourced/verified (want sha256 $EVALUATOR_SHA256)" >&2
         exit 5
     fi
 fi
