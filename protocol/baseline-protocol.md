@@ -164,3 +164,20 @@ Baseline certification requires ALL of:
 
 The certified baseline value is the mean of the 3 primary-metric values; the
 per-run values are recorded unmodified in the evidence bundle.
+
+## 12. Certification record (post-verdict, added after PASS)
+
+- Certified commit: `15c78044b94d57c0cfd84eedc6b547b3c87b99d9`, tag `baseline/v1`
+- Runs: `pycil-5ea1f7030bea`, `pycil-5162a9a9d903`, `pycil-0c64cead84a1` — all
+  `succeeded`, exit 0, metric `0.59485` each (spread 0.0 pp), mean **0.59485**
+- Verifier: `openresearch.certify`, decision `PASS`, evidence_sha256
+  `bcea685a3d692de4c2028236e690a11a559a56296be67125483ff810afa9408d`, 44/44 checks
+- Environment identity (from run stdout): host `fuxin`, Ubuntu 20.04.6,
+  Python 3.8.10, torch 2.4.1+cu121, cudnn 90100, RTX 3090, driver 550.78,
+  dependency-lock sha256 `f8ae96df0beaac5d6d98a25290c41e970b1ae56cc9ca30aa575267ce10b28a4c`,
+  dataset sha256 `85cd44d02ba6437773c5bbd22e183051d648de2e7d6b014e1ef29b855ba677a7`
+- Failed dispatch preserved (append-only): `pycil-dc34b51bac30` — run.sh bash
+  parameter-expansion bug (exit 2, no training executed); root-caused and fixed
+  in `15c78044b94d57c0cfd84eedc6b547b3c87b99d9`.
+- This section was appended AFTER the verifier PASS; criteria in §11 were not
+  modified. BASELINE.md and task status were updated only after PASS per §11.9.
