@@ -9,7 +9,7 @@
 # Usage: bash public_validation/run.sh {val|test}
 set -euo pipefail
 
-SPLIT="${1:?usage: run.sh {val|test}}"
+SPLIT="${1:?usage: run.sh val or test}"
 case "$SPLIT" in val|test) ;; *) echo "unknown split: $SPLIT" >&2; exit 2;; esac
 
 FROZEN_VENV="${FROZEN_VENV:-/home/zhoujunjie/openresearch-envs/pycil-baseline}"
