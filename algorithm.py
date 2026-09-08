@@ -42,9 +42,9 @@ def get_pycil_config():
         # Reduced epoch settings for 30-min budget
         # Original: init_epoch=200, epochs=170
         # Reduced: init_epoch=60, epochs=50
-        "init_epoch": 150,
+        "init_epoch": 100,
         "init_lr": 0.1,
-        "init_milestones": [50, 110, 140],
+        "init_milestones": [30, 70, 90],
         "init_lr_decay": 0.1,
         "init_weight_decay": 0.0005,
 
