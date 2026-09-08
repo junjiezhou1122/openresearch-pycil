@@ -103,7 +103,9 @@ not fully bitwise-stable across kernel schedules under concurrent load).
 
 ## 7. Resource and time budget
 
-- Wall-clock per run: ≤ 90 minutes (runner timeout 5400 s).
+- Wall-clock per run: ≤ 120 minutes (runner timeout 7200 s). Amended from 90
+  minutes BEFORE any certified measurement was observed, based on a 1-epoch
+  smoke estimate and server CPU contention (shared host, load ~90).
 - GPU memory: single 3090 (24 GB) is sufficient for ResNet-32 batch 128.
 - The run script aborts (non-zero exit) if the metric cannot be parsed.
 
