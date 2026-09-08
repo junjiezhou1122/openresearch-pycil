@@ -53,5 +53,5 @@ def get_pycil_config():
         "milestones": [30, 55],
         "lrate_decay": 0.1,
         "batch_size": 128,
-        "weight_decay": 0.0002,
+        "weight_decay": 0.0005,
     }
