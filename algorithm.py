@@ -48,9 +48,9 @@ def get_pycil_config():
         "init_lr_decay": 0.1,
         "init_weight_decay": 0.0005,
 
-        "epochs": 70,
+        "epochs": 50,
         "lrate": 0.1,
-        "milestones": [30, 55],
+        "milestones": [20, 35],
         "lrate_decay": 0.1,
         "batch_size": 128,
         "weight_decay": 0.0002,
