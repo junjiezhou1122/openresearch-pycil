@@ -13,6 +13,55 @@ but must keep the BaseLearner interface (incremental_train, eval_task, after_tas
 """
 
 
+_H007_PATCH_INSTALLED = False
+
+
+def _install_classifier_weight_alignment_patch():
+    """H007 minimal intervention (algorithm.py-only).
+
+    Call the EXISTING `IncrementalNet.weight_align(increment)` exactly once
+    per incremental stage, immediately after that stage's training finishes
+    and before `trainer.py` calls `eval_task()` for the stage. Nothing else is
+    changed: same iCaRL class, loss, optimizer, schedule, memory and exemplar
+    selection. `weight_align` rescales the new-class rows of the classifier
+    weight matrix so their mean L2 norm matches the old-class rows, which is
+    the standard WA-style linear-head calibration.
+
+    The wrapper must target `iCaRL.incremental_train` itself, not
+    `BaseLearner.incremental_train`: iCaRL overrides that method, so wrapping
+    the base-class attribute would never be reached (an earlier revision of
+    this patch wrapped the base class and was provably inert -- stage 1 was
+    bit-identical to H001 and no `alignweights,gamma=` line was printed).
+
+    The base stage (task 0) is skipped because it has no old classes, i.e.
+    aligning there would be undefined.
+    """
+    global _H007_PATCH_INSTALLED
+    if _H007_PATCH_INSTALLED:
+        return
+
+    import torch
+    from models.icarl import iCaRL
+
+    original_incremental_train = iCaRL.incremental_train
+
+    def _incremental_train_with_weight_align(self, data_manager):
+        result = original_incremental_train(self, data_manager)
+        if self._cur_task <= 0:
+            return result
+        network = self._network
+        if isinstance(network, torch.nn.DataParallel):
+            network = network.module
+        # At this point _known_classes still holds the previous stage total
+        # (BaseLearner.after_task updates it only after eval_task), so this is
+        # exactly the increment of the stage that just trained.
+        network.weight_align(self._total_classes - self._known_classes)
+        return result
+
+    iCaRL.incremental_train = _incremental_train_with_weight_align
+    _H007_PATCH_INSTALLED = True
+
+
 def get_pycil_config():
     """
     Return PyCIL experiment configuration.
@@ -25,6 +74,8 @@ def get_pycil_config():
     - convnet_type: Backbone architecture
     - Other hyperparameters specific to the chosen model
     """
+    # H007: post-training new-class classifier weight-norm alignment.
+    _install_classifier_weight_alignment_patch()
     return {
         "prefix": "benchmark",
         "dataset": "cifar100",
