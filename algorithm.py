@@ -35,7 +35,7 @@ def get_pycil_config():
         "init_cls": 50,
         "increment": 10,
         "model_name": "icarl",
-        "convnet_type": "resnet32",
+        "convnet_type": "resnet18_cbam",
         "device": ["0"],
         "seed": [1993],
 
