@@ -13,6 +13,37 @@ but must keep the BaseLearner interface (incremental_train, eval_task, after_tas
 """
 
 
+# ---------------------------------------------------------------------------
+# H018: the third budget point - is the memory->NME response monotone or saturating?
+#
+# Wave 3 established the exemplar budget as the only lever that has ever moved the
+# accepted metric, and wave 4 closed the selection axis:
+#   * H013 (valid/supported): memory_size 2000 -> 4000 took aggregate NME from
+#     0.6605167 to 0.6881833 (+2.7666 pp), entirely old-class retention.
+#   * H014 (valid/refuted): that gain is replay/representation-side, not prototype-side.
+#   * H015 (valid/supported, +1.0000 pp) and H016 (valid/supported, +1.165 pp,
+#     independent draw): herding beats RANDOM selection at the same budget, so
+#     ~1.1 pp of the gain is the stored set's information content.
+#   * H017 (valid/refuted): greedy k-center is 3.00 pp WORSE than herding and below
+#     both random draws, so coverage is the wrong axis and herding is at the ceiling.
+#
+# With the selection axis closed, the only open question on this lever is its SHAPE.
+# H018 is therefore the third point of the budget->NME response curve and is again a
+# ONE-NUMBER intervention: raise memory_size 4000 -> 6000 (120 -> 60 exemplars per
+# class across the six stages). Everything else is byte-identical to H001/H013.
+#
+# Pre-registered reading: if the response is still rising materially at 4000, the
+# 6000 point must add at least +1.0 pp of aggregate NME over H013's 68.8183 (a
+# quarter of the 2000->4000 step, and far above the 0.0 pp same-stack deterministic
+# noise floor); if the response has saturated, the increment is smaller.
+#
+# Because this changes the training set (more replay data), no exact invariance
+# control is available; the registered comparison is against H013's 4000 point and
+# H001's 2000 point, with the measured 0.0 pp noise floor for same-stack
+# reported-precision comparisons.
+# ---------------------------------------------------------------------------
+
+
 def get_pycil_config():
     """
     Return PyCIL experiment configuration.
@@ -28,7 +59,7 @@ def get_pycil_config():
     return {
         "prefix": "benchmark",
         "dataset": "cifar100",
-        "memory_size": 2000,
+        "memory_size": 6000,   # H018: third budget point (baseline 2000, H013 = 4000)
         "memory_per_class": 20,
         "fixed_memory": False,
         "shuffle": True,
