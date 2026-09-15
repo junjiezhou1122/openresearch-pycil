@@ -13,6 +13,33 @@ but must keep the BaseLearner interface (incremental_train, eval_task, after_tas
 """
 
 
+# ---------------------------------------------------------------------------
+# H013: memory-budget response experiment (wave 3, search space "memory-budget").
+#
+# Wave 2 identified the binding constraint POSITIVELY rather than by elimination:
+#   * H010 (valid/refuted) and H012 (valid/refuted) showed that no closed-form
+#     readout fitted on the learner's real information set beats the registered
+#     nearest-mean rule (-0.66 pp and -0.67 pp aggregate), so the registered rule
+#     already sits at the learner's information-set frontier.
+#   * H011 (valid/supported) showed a full-train oracle DOES beat it at every
+#     incremental stage (+0.94/+2.66/+3.13/+3.67/+3.77 pp; +2.36 pp aggregate),
+#     with the entire gain on OLD classes (+2.3..+5.2 pp) and new-class accuracy
+#     regressing (-6.0..-11.3 pp).
+#
+# So the +2.36 pp of headroom exists in the frozen features but requires more
+# OLD-class data than the 2000-exemplar budget holds. H013 tests that directly
+# and is deliberately a ONE-NUMBER intervention: raise memory_size 2000 -> 4000
+# (20 -> 40 exemplars/class at the final stage; 80/class at the base stage).
+# Everything else is byte-identical to the frozen H001 configuration.
+#
+# This is a resource lever identified BY evidence, not a blind parameter sweep.
+# Because it changes the training set (more exemplars enter KD and the classifier
+# loss), no exact invariance control is available; the registered comparison is
+# against H001 and the H011 oracle bound, with the measured 0.0 pp H004 noise
+# floor for the fixed-stack comparisons.
+# ---------------------------------------------------------------------------
+
+
 def get_pycil_config():
     """
     Return PyCIL experiment configuration.
@@ -28,7 +55,7 @@ def get_pycil_config():
     return {
         "prefix": "benchmark",
         "dataset": "cifar100",
-        "memory_size": 2000,
+        "memory_size": 4000,   # H013: doubled exemplar budget (was 2000)
         "memory_per_class": 20,
         "fixed_memory": False,
         "shuffle": True,
