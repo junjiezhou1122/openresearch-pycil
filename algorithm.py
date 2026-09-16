@@ -10,6 +10,26 @@ with a different continual learning algorithm from PyCIL (e.g., 'der', 'foster',
 
 To make deeper changes, agents can also modify models/icarl.py directly,
 but must keep the BaseLearner interface (incremental_train, eval_task, after_task).
+
+-------------------------------------------------------------------------------
+H026 representation-learning Oracle: Offline Joint Multitask Training Bound
+-------------------------------------------------------------------------------
+Wave 6 concluded by empirically and theoretically exhausting the replay memory
+and readout geometry search spaces (H018 reached 70.8217% NME, and H021 proved
+the full-train linear probe only reaches 71.36% with +0.54 pp headroom remaining).
+
+To open the `representation-learning` search space and guide feature-level
+distillation and regularisation interventions, H026 measures the true physical
+upper bound of the feature extractor: Offline Joint Multitask Training.
+
+By setting init_cls=100 and increment=0, all 100 CIFAR-100 classes are trained
+jointly in a single stage without continual learning or catastrophic forgetting,
+using the exact same ResNet-18 architecture, seed (1993), 100 epochs, and
+optimiser schedule as the continual learning base stage.
+
+The resulting accuracy defines the gold-standard Oracle bound (~76-78%), and
+the delta (Joint Oracle minus 70.8217%) quantifies the exact "representation
+drift tax" imposed by continual learning.
 """
 
 
@@ -17,13 +37,8 @@ def get_pycil_config():
     """
     Return PyCIL experiment configuration.
 
-    Agents can modify:
-    - model_name: Switch to a different CL algorithm (der, foster, memo, etc.)
-    - init_epoch / epochs: Number of training epochs per stage
-    - memory_size: Total exemplar memory budget
-    - init_cls / increment: Class-incremental schedule
-    - convnet_type: Backbone architecture
-    - Other hyperparameters specific to the chosen model
+    H026: Offline Joint Multitask Training Oracle (100 classes in one stage).
+    All architecture, seed, and base-stage training hyperparameters are identical to H001.
     """
     return {
         "prefix": "benchmark",
@@ -32,16 +47,14 @@ def get_pycil_config():
         "memory_per_class": 20,
         "fixed_memory": False,
         "shuffle": True,
-        "init_cls": 50,
-        "increment": 10,
+        "init_cls": 100,
+        "increment": 0,
         "model_name": "icarl",
         "convnet_type": "resnet18",
         "device": ["0"],
         "seed": [1993],
 
-        # Reduced epoch settings for 30-min budget
-        # Original: init_epoch=200, epochs=170
-        # Reduced: init_epoch=60, epochs=50
+        # Identical to H001 base-stage training
         "init_epoch": 100,
         "init_lr": 0.1,
         "init_milestones": [30, 70, 90],
