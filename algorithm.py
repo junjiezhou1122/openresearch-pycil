@@ -1778,6 +1778,19 @@ def _h036_synthetic_checks():
     metrics = _h036_distance_metrics(_h036_normalize_rows([[1.0, 0.0], [0.0, 1.0]]), np.asarray([0, 1]), prototypes)
     if metrics["predicted"].tolist() != [0, 1]:
         raise AssertionError("H036 prototype classification check failed")
+    # The final endpoint must reuse the official H033 arithmetic.  Make the
+    # distinction observable with a deliberately perturbed center matrix whose
+    # predictions differ from the exact endpoint.
+    endpoint_vectors = np.asarray([[1.0, 0.0], [0.0, 1.0]])
+    endpoint_centers = np.asarray([[1.0, 0.0], [0.0, 1.0]])
+    reused_endpoint = _h036_distance_metrics(endpoint_vectors, np.asarray([0, 1]), endpoint_centers)
+    perturbed_endpoint = _h036_distance_metrics(
+        endpoint_vectors,
+        np.asarray([0, 1]),
+        np.asarray([[0.0, 1.0], [1.0, 0.0]]),
+    )
+    if np.array_equal(reused_endpoint["predicted"], perturbed_endpoint["predicted"]):
+        raise AssertionError("H036 exact endpoint reuse check failed")
     official = {"predicted": np.asarray([1, 0, 0]), "vectors": np.asarray([[0.0, 1.0], [1.0, 0.0], [0.8, 0.2]])}
     competitors = _h036_competitor_classes(np.asarray([0, 1, 0]), official, np.asarray([[1.0, 0.0], [0.0, 1.0]]))
     if competitors.tolist() != [1, 0, 1]:
@@ -1788,7 +1801,7 @@ def _h036_synthetic_checks():
         raise AssertionError("H036 transition conservation check failed")
     if _h036_select_transition(transitions, 3, assignments) != "layer3->layer4":
         raise AssertionError("H036 deterministic transition selection check failed")
-    return {"pooling_normalization": True, "prototype_classification": True, "official_competitor": True, "transition_conservation": True, "deterministic_selection": True}
+    return {"pooling_normalization": True, "prototype_classification": True, "exact_endpoint_reuse": True, "official_competitor": True, "transition_conservation": True, "deterministic_selection": True}
 
 
 def _h036_record(learner, data_manager, test_vectors, test_labels, official_centers, official_metrics):
@@ -1822,20 +1835,35 @@ def _h036_record(learner, data_manager, test_vectors, test_labels, official_cent
             raise FloatingPointError("H036 official accuracy is non-finite")
         official_payload = {"predicted": official_predictions, "vectors": test_vectors}
         competitors = _h036_competitor_classes(test_labels, official_payload, official_centers)
+        final_test_vectors = np.asarray(test_vectors)
+        if final_test_vectors.ndim != 2 or len(final_test_vectors) != len(test_labels):
+            raise RuntimeError("H036 final H033 test vectors have incompatible shape")
+        if test_layers["final_embedding"].shape != final_test_vectors.shape:
+            raise RuntimeError("H036 final test vector shape disagrees with H033 vectors")
+        # H033 already extracted and normalized the exact evaluator endpoint.
+        # Reuse those vectors and official rehearsal-only centers for the final
+        # layer; independently recomputed H036 final prototypes are diagnostic
+        # inputs only and must not affect endpoint predictions or margins.
+        final_metrics = _h036_distance_metrics(test_vectors, test_labels, official_centers)
+        if not np.array_equal(final_metrics["predicted"], official_predictions):
+            raise AssertionError("H036 final_embedding predictions disagree with H033 official NME")
         layer_records = {}
         predictions = []
         pair_margins = []
         for layer in _H036_LAYERS:
             if test_layers[layer].shape[1] != memory_layers[layer].shape[1]:
                 raise RuntimeError("H036 {} test/memory feature dimensions disagree".format(layer))
-            prototypes = _h036_prototypes(memory_layers[layer], memory_targets, learner._total_classes)
-            metrics = _h036_distance_metrics(test_layers[layer], test_labels, prototypes)
-            if layer == "final_embedding" and not np.array_equal(metrics["predicted"], official_predictions):
-                raise AssertionError("H036 final_embedding predictions disagree with H033 official NME")
+            if layer == "final_embedding":
+                metrics = final_metrics
+            else:
+                prototypes = _h036_prototypes(memory_layers[layer], memory_targets, learner._total_classes)
+                metrics = _h036_distance_metrics(test_layers[layer], test_labels, prototypes)
             competitor_distance = metrics["distances"][np.arange(len(test_labels)), competitors]
             pair_margin = competitor_distance - metrics["true_distance"]
             if not np.isfinite(pair_margin).all():
                 raise FloatingPointError("H036 pair margin is non-finite")
+            if layer == "final_embedding" and np.any(official_error & (pair_margin > 0.0)):
+                raise AssertionError("H036 final endpoint errors must be non-positive in transition margins")
             old_mask = test_labels < learner._known_classes
             groups = {"total": np.ones(len(test_labels), dtype=bool), "old": old_mask, "new": ~old_mask}
             task_age_summaries = {}
@@ -1880,12 +1908,12 @@ def _h036_record(learner, data_manager, test_vectors, test_labels, official_cent
             pending_artifact = {
                 "schema": "openresearch.h036-decision-local-geometry.v1",
                 "hypothesis": "decision-local layer geometry can identify intermediate headroom or a stage-local margin collapse",
-                "protocol": {"model": "iCaRL", "convnet": "resnet18", "memory_size": 6000, "seed": 1993, "layers": list(_H036_LAYERS), "memory_loader": "mode=test; shuffle=False; num_workers=0", "normalization": "NumPy (vectors.T / (norm(vectors.T, axis=0) + EPSILON)).T"},
+                "protocol": {"model": "iCaRL", "convnet": "resnet18", "memory_size": 6000, "seed": 1993, "layers": list(_H036_LAYERS), "memory_loader": "mode=test; shuffle=False; num_workers=0", "normalization": "NumPy (vectors.T / (norm(vectors.T, axis=0) + EPSILON)).T", "final_embedding_endpoint": "reuse exact H033 normalized test_vectors and official_centers via _h036_distance_metrics; no H036 final prototype recomputation", "intermediate_layers": "independently constructed from current-network rehearsal-only prototypes", "transition_semantics": "for official-error rows, final_embedding is the official H033 endpoint and its pair margin must be non-positive; adjacent transitions therefore measure collapse into that endpoint"},
                 "preregistration": {"intermediate_headroom_supported": "any non-final final-task accuracy >= official accuracy + 0.5pp", "stage_local_collapse_supported": "one adjacent transition receives >=10% of final official errors in last-positive partition", "selection": "maximum transition count with registered layer-order tie break", "otherwise": "do not recommend layer-specific repair"},
                 "measurements": learner._h036_measurements,
                 "final_task_reading": {"intermediate_headroom_supported": bool(intermediate_supported), "stage_local_collapse_supported": bool(stage_supported), "selected_transition": transition_selection, "recommendation": ("stage-local repair at {}".format(transition_selection) if stage_supported else ("intermediate headroom" if intermediate_supported else "no layer-specific repair"))},
                 "synthetic_checks": learner._h036_synthetic_checks,
-                "limitations": ["layer summaries are descriptive and do not establish causal repair", "prototypes are rehearsal-only and the official competitor is defined by final-embedding NME", "global average pooling cannot localize spatial causes"],
+                "limitations": ["layer summaries are descriptive and do not establish causal repair", "final_embedding reuses the official H033 arithmetic endpoint, while intermediate layers use independently constructed current-network rehearsal-only prototypes", "global average pooling cannot localize spatial causes"],
             }
     finally:
         if mode_before:
