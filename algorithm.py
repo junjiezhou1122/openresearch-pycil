@@ -1574,7 +1574,7 @@ def _h036_extract_layers(learner, loader):
                 batch_values["final_embedding"] = final.detach().cpu()
                 batch_size = int(len(targets))
                 for name in _H036_LAYERS:
-                    value = batch_values[name].numpy()
+                    value = batch_values[name].detach().cpu().numpy()
                     if value.shape[0] != batch_size:
                         raise RuntimeError("H036 {} batch size mismatch".format(name))
                     outputs[name].append(_h036_pool_feature(value))
