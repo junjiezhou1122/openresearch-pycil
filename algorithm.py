@@ -368,26 +368,23 @@ def _h033_sample_summary(mask, true_distance, impostor_distance, margin, error):
 
 def _h033_extract_normalized(learner, loader):
     import numpy as np
-    import torch
-    from torch import nn
+    # Use the learner's own extraction path so this observer cannot silently
+    # diverge from BaseLearner._eval_nme (DataParallel handling, dtype, and
+    # loader traversal all remain in one source of truth).
+    from models.base import EPSILON
 
-    network = learner._network.module if isinstance(learner._network, nn.DataParallel) else learner._network
-    features, targets = [], []
-    network.eval()
-    with torch.no_grad():
-        for _, inputs, batch_targets in loader:
-            raw = network.extract_vector(inputs.to(learner._device))
-            raw = raw.detach().float()
-            norm = raw.norm(dim=1, keepdim=True)
-            if not torch.isfinite(raw).all() or not torch.isfinite(norm).all():
-                raise FloatingPointError("H033 encountered non-finite embedding values")
-            normalized = raw / (norm + 1e-8)
-            features.append(normalized.cpu().numpy())
-            targets.append(batch_targets.detach().cpu().numpy())
-    if not features:
+    vectors, labels = learner._extract_vectors(loader)
+    vectors = np.asarray(vectors)
+    labels = np.asarray(labels, dtype=np.int64)
+    if vectors.ndim != 2 or labels.ndim != 1 or len(vectors) != len(labels):
+        raise RuntimeError("H033 extracted vectors/labels have incompatible shapes")
+    if len(vectors) == 0:
         raise RuntimeError("H033 received an empty deterministic loader")
-    vectors = np.concatenate(features, axis=0).astype(np.float64, copy=False)
-    labels = np.concatenate(targets, axis=0).astype(np.int64, copy=False)
+    if not np.isfinite(vectors).all():
+        raise FloatingPointError("H033 encountered non-finite embedding values")
+    # This is intentionally the exact NumPy expression used by
+    # BaseLearner._eval_nme, including its repository EPSILON value.
+    vectors = (vectors.T / (np.linalg.norm(vectors.T, axis=0) + EPSILON)).T
     if not np.isfinite(vectors).all():
         raise FloatingPointError("H033 normalized embeddings are non-finite")
     return vectors, labels
@@ -395,28 +392,25 @@ def _h033_extract_normalized(learner, loader):
 
 def _h033_distance_metrics(vectors, labels, centers):
     import numpy as np
+    from scipy.spatial.distance import cdist
 
     if centers.ndim != 2 or vectors.ndim != 2 or vectors.shape[1] != centers.shape[1]:
         raise RuntimeError("H033 vector/center shapes are incompatible")
-    n_samples, n_classes = len(labels), len(centers)
-    true_distance = np.empty(n_samples, dtype=np.float64)
-    impostor_distance = np.empty(n_samples, dtype=np.float64)
-    predicted = np.empty(n_samples, dtype=np.int64)
-    chunk_size = 256
-    for start in range(0, n_samples, chunk_size):
-        stop = min(start + chunk_size, n_samples)
-        delta = vectors[start:stop, None, :] - centers[None, :, :]
-        distances = np.einsum("ncd,ncd->nc", delta, delta)
-        batch_labels = labels[start:stop]
-        rows = np.arange(stop - start)
-        true_distance[start:stop] = distances[rows, batch_labels]
-        distances[rows, batch_labels] = np.inf
-        impostor_distance[start:stop] = distances.min(axis=1)
-        # The distances above are masked only for impostor selection; recompute
-        # argmin from the unmasked matrix so official ties/order stay exactly
-        # equivalent to scipy.spatial.distance.cdist.
-        original = np.einsum("ncd,ncd->nc", delta, delta)
-        predicted[start:stop] = np.argmin(original, axis=1)
+    if labels.ndim != 1 or len(labels) != len(vectors):
+        raise RuntimeError("H033 labels do not match extracted vectors")
+    if np.any(labels < 0) or np.any(labels >= len(centers)):
+        raise RuntimeError("H033 labels fall outside the class-center range")
+
+    # BaseLearner._eval_nme calls scipy.spatial.distance.cdist and then
+    # np.argsort.  Reuse both operations here so tie ordering and floating
+    # point arithmetic are directly compatible with the official evaluator.
+    distances = cdist(vectors, centers, "sqeuclidean")
+    rows = np.arange(len(labels))
+    true_distance = distances[rows, labels]
+    impostor_distances = distances.copy()
+    impostor_distances[rows, labels] = np.inf
+    impostor_distance = impostor_distances.min(axis=1)
+    predicted = np.argsort(distances, axis=1)[:, 0].astype(np.int64, copy=False)
     margin = impostor_distance - true_distance
     if not all(np.isfinite(a).all() for a in (true_distance, impostor_distance, margin)):
         raise FloatingPointError("H033 distance metrics are non-finite")
@@ -431,41 +425,48 @@ def _h033_distance_metrics(vectors, labels, centers):
 def _h033_full_centers(learner, data_manager, total_classes, feature_dim):
     import numpy as np
     from torch.utils.data import DataLoader
+    from models.base import EPSILON
 
     dataset = data_manager.get_dataset(
         np.arange(total_classes), source="train", mode="test"
     )
     loader = DataLoader(dataset, batch_size=256, shuffle=False, num_workers=0)
-    network = learner._network
+    # Keep full-train geometry on the same extraction and NumPy normalization
+    # path as official NME.  The resulting matrix is diagnostic-only and is
+    # released once sufficient statistics have been accumulated below.
+    vectors, labels = learner._extract_vectors(loader)
+    vectors = np.asarray(vectors)
+    labels = np.asarray(labels, dtype=np.int64)
+    if vectors.ndim != 2 or vectors.shape[1] != feature_dim:
+        raise RuntimeError("H033 full-train vectors have an unexpected shape")
+    if labels.ndim != 1 or len(vectors) != len(labels):
+        raise RuntimeError("H033 full-train vectors/labels have incompatible shapes")
+    if len(vectors) == 0:
+        raise RuntimeError("H033 full-train loader yielded no samples")
+    if np.any(labels < 0) or np.any(labels >= total_classes):
+        raise RuntimeError("H033 full-train labels fall outside the class range")
+    if not np.isfinite(vectors).all():
+        raise FloatingPointError("H033 full-train embeddings are non-finite")
+    vectors = (vectors.T / (np.linalg.norm(vectors.T, axis=0) + EPSILON)).T
+    if not np.isfinite(vectors).all():
+        raise FloatingPointError("H033 normalized full-train embeddings are non-finite")
+
     sums = np.zeros((total_classes, feature_dim), dtype=np.float64)
     squared_norm_sums = np.zeros(total_classes, dtype=np.float64)
     counts = np.zeros(total_classes, dtype=np.int64)
-
-    # Accumulate only sufficient statistics; no full-train feature matrix is
-    # retained on the learner or in the final artifact.
-    import torch
-    from torch import nn
-
-    network = network.module if isinstance(network, nn.DataParallel) else network
-    network.eval()
-    with torch.no_grad():
-        for _, inputs, labels in loader:
-            raw = network.extract_vector(inputs.to(learner._device)).detach().float()
-            norm = raw.norm(dim=1, keepdim=True)
-            if not torch.isfinite(raw).all() or not torch.isfinite(norm).all():
-                raise FloatingPointError("H033 full-train embeddings are non-finite")
-            vectors = (raw / (norm + 1e-8)).cpu().numpy().astype(np.float64, copy=False)
-            labels = labels.numpy().astype(np.int64, copy=False)
-            np.add.at(sums, labels, vectors)
-            np.add.at(squared_norm_sums, labels, np.sum(vectors * vectors, axis=1))
-            np.add.at(counts, labels, 1)
+    vectors64 = vectors.astype(np.float64, copy=False)
+    np.add.at(sums, labels, vectors64)
+    np.add.at(squared_norm_sums, labels, np.sum(vectors64 * vectors64, axis=1))
+    np.add.at(counts, labels, 1)
     if np.any(counts == 0):
         raise RuntimeError("H033 full-train center missing a seen class")
     means = sums / counts[:, None]
-    mean_norms = np.linalg.norm(means, axis=1, keepdims=True)
-    if np.any(mean_norms <= 0.0) or not np.isfinite(mean_norms).all():
-        raise FloatingPointError("H033 full-train center has zero/non-finite norm")
-    means /= mean_norms
+    if not np.isfinite(means).all():
+        raise FloatingPointError("H033 full-train center is non-finite")
+    # Normalize centers with the same NumPy/EPSILON convention as embeddings.
+    means = (means.T / (np.linalg.norm(means.T, axis=0) + EPSILON)).T
+    if not np.isfinite(means).all():
+        raise FloatingPointError("H033 normalized full-train center is non-finite")
     dispersion = (
         squared_norm_sums / counts
         - 2.0 * np.sum(means * sums, axis=1) / counts
