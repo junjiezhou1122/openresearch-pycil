@@ -910,6 +910,524 @@ def _h034_record(
     print("H034_CENTER_INTERPOLATION_JSON " + json.dumps(artifact, sort_keys=True, separators=(",", ":")), flush=True)
 
 
+# ---------------------------------------------------------------------------
+# H035: measurement-only exemplar uncertainty and confusion-pair telemetry.
+#
+# Uncertainty is deliberately computed only from the stored rehearsal memory.
+# The full-train diagnostic path belongs to H034 and is used below solely to
+# reproduce its pre-registered old_only alpha=0.5 comparison on the final
+# task.  No H035 quantity describing exemplar uncertainty reads full-train
+# samples or centers.
+# ---------------------------------------------------------------------------
+
+_H035_PATCH_INSTALLED = False
+_H035_PRIMARY_METRICS = ("dispersion_mean", "loo_instability_mean")
+_H035_EPSILON = 1e-8  # models.base.EPSILON, kept literal for pure CPU checks
+
+
+def _h035_normalize_rows(vectors):
+    import numpy as np
+
+    vectors = np.asarray(vectors, dtype=np.float64)
+    if vectors.ndim != 2 or vectors.shape[0] == 0:
+        raise RuntimeError("H035 vectors must be a non-empty matrix")
+    if not np.isfinite(vectors).all():
+        raise FloatingPointError("H035 vectors are non-finite before normalization")
+    normalized = (vectors.T / (np.linalg.norm(vectors.T, axis=0) + _H035_EPSILON)).T
+    if not np.isfinite(normalized).all():
+        raise FloatingPointError("H035 normalized vectors are non-finite")
+    return normalized
+
+
+def _h035_percentile(values, percentile):
+    import numpy as np
+
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0 or not np.isfinite(values).all():
+        raise FloatingPointError("H035 percentile input is empty or non-finite")
+    result = float(np.percentile(values, percentile, method="linear"))
+    if not np.isfinite(result):
+        raise FloatingPointError("H035 percentile is non-finite")
+    return result
+
+
+def _h035_exemplar_class_metrics(vectors, labels, official_centers, total_classes):
+    """Compute uncertainty from normalized rehearsal exemplars only."""
+    import numpy as np
+
+    vectors = _h035_normalize_rows(vectors)
+    labels = np.asarray(labels, dtype=np.int64)
+    centers = np.asarray(official_centers, dtype=np.float64)
+    if labels.ndim != 1 or len(labels) != len(vectors):
+        raise RuntimeError("H035 exemplar labels do not match vectors")
+    if centers.shape != (total_classes, vectors.shape[1]):
+        raise RuntimeError("H035 official exemplar-center shape mismatch")
+    if np.any(labels < 0) or np.any(labels >= total_classes):
+        raise RuntimeError("H035 exemplar label is outside seen classes")
+    if not np.isfinite(centers).all():
+        raise FloatingPointError("H035 official exemplar centers are non-finite")
+
+    rows = []
+    for class_id in range(total_classes):
+        class_vectors = vectors[labels == class_id]
+        count = int(len(class_vectors))
+        if count == 0:
+            raise RuntimeError("H035 missing rehearsal exemplars for class {}".format(class_id))
+        if count < 2:
+            raise RuntimeError("H035 needs at least two exemplars for deterministic LOO class {}".format(class_id))
+        raw_center = np.mean(class_vectors, axis=0)
+        raw_center_norm = float(np.linalg.norm(raw_center))
+        if not np.isfinite(raw_center_norm) or raw_center_norm <= 0.0:
+            raise FloatingPointError("H035 class {} center norm is invalid".format(class_id))
+        all_center = _h035_normalize_rows(raw_center.reshape(1, -1))[0]
+        # _class_means is the official exemplar center.  Normalize it again
+        # with the repository NumPy/EPSILON convention before distances.
+        official_center = _h035_normalize_rows(centers[class_id].reshape(1, -1))[0]
+        squared = np.sum((class_vectors - official_center) ** 2, axis=1)
+        loo_squared = []
+        loo_cosine = []
+        for index in range(count):
+            loo_raw = np.sum(class_vectors, axis=0) - class_vectors[index]
+            loo_center = _h035_normalize_rows(loo_raw.reshape(1, -1))[0]
+            distance = float(np.sum((loo_center - all_center) ** 2))
+            cosine = float(np.sum(loo_center * all_center))
+            if not np.isfinite(distance) or not np.isfinite(cosine):
+                raise FloatingPointError("H035 LOO metric is non-finite")
+            loo_squared.append(distance)
+            loo_cosine.append(cosine)
+        values = {
+            "class": int(class_id),
+            "exemplar_count": count,
+            "dispersion_mean": float(np.mean(squared)),
+            "dispersion_p95": _h035_percentile(squared, 95),
+            "loo_instability_mean": float(np.mean(loo_squared)),
+            "loo_instability_p95": _h035_percentile(loo_squared, 95),
+            "loo_cosine_mean": float(np.mean(loo_cosine)),
+            "loo_cosine_p95": _h035_percentile(loo_cosine, 95),
+            "center_norm_before_normalization": raw_center_norm,
+        }
+        if not all(np.isfinite(float(value)) for key, value in values.items() if key != "class"):
+            raise FloatingPointError("H035 class {} uncertainty is non-finite".format(class_id))
+        rows.append(values)
+    return rows
+
+
+def _h035_spearman(x_values, y_values):
+    """Tie-stable Spearman rho; constant vectors map to finite zero."""
+    import numpy as np
+
+    x_values = np.asarray(x_values, dtype=np.float64)
+    y_values = np.asarray(y_values, dtype=np.float64)
+    if x_values.ndim != 1 or y_values.shape != x_values.shape or len(x_values) < 2:
+        raise RuntimeError("H035 Spearman inputs have incompatible shapes")
+    if not np.isfinite(x_values).all() or not np.isfinite(y_values).all():
+        raise FloatingPointError("H035 Spearman inputs are non-finite")
+
+    def average_ranks(values):
+        order = np.argsort(values, kind="mergesort")
+        ranks = np.empty(len(values), dtype=np.float64)
+        start = 0
+        while start < len(values):
+            end = start + 1
+            while end < len(values) and values[order[end]] == values[order[start]]:
+                end += 1
+            ranks[order[start:end]] = 0.5 * (start + end - 1) + 1.0
+            start = end
+        return ranks
+
+    xr, yr = average_ranks(x_values), average_ranks(y_values)
+    xc, yc = xr - np.mean(xr), yr - np.mean(yr)
+    denominator = float(np.sqrt(np.sum(xc * xc) * np.sum(yc * yc)))
+    if denominator == 0.0:
+        return 0.0
+    result = float(np.sum(xc * yc) / denominator)
+    if not np.isfinite(result):
+        raise FloatingPointError("H035 Spearman rho is non-finite")
+    return result
+
+
+def _h035_quartile_partition(metric_values, class_ids=None):
+    """Return deterministic bottom/top quartiles (ties break by class id)."""
+    import numpy as np
+
+    values = np.asarray(metric_values, dtype=np.float64)
+    if values.ndim != 1 or len(values) < 4 or not np.isfinite(values).all():
+        raise RuntimeError("H035 quartiles require at least four finite values")
+    if class_ids is None:
+        class_ids = np.arange(len(values), dtype=np.int64)
+    class_ids = np.asarray(class_ids, dtype=np.int64)
+    if class_ids.shape != values.shape:
+        raise RuntimeError("H035 quartile class ids do not match metric values")
+    order = np.array(sorted(range(len(values)), key=lambda i: (float(values[i]), int(class_ids[i]))), dtype=np.int64)
+    parts = np.array_split(order, 4)
+    return {
+        "bottom": parts[0].copy(),
+        "q2": parts[1].copy(),
+        "q3": parts[2].copy(),
+        "top": parts[3].copy(),
+    }
+
+
+def _h035_confusion_pairs(labels, predicted, margins, increments):
+    """Aggregate exact directed official errors for one recorded task."""
+    import numpy as np
+
+    labels = np.asarray(labels, dtype=np.int64)
+    predicted = np.asarray(predicted, dtype=np.int64)
+    margins = np.asarray(margins, dtype=np.float64)
+    increments = np.asarray(increments, dtype=np.int64)
+    if labels.ndim != 1 or predicted.shape != labels.shape or margins.shape != labels.shape:
+        raise RuntimeError("H035 confusion arrays have incompatible shapes")
+    if len(labels) == 0 or np.any(~np.isfinite(margins)):
+        raise RuntimeError("H035 confusion arrays are empty or non-finite")
+    total_classes = int(np.sum(increments))
+    true_age = _h034_task_age_ids(labels, increments, total_classes)
+    predicted_age = _h034_task_age_ids(predicted, increments, total_classes)
+    pairs = {}
+    for true_class, predicted_class, age, pred_age, margin in zip(
+        labels, predicted, true_age, predicted_age, margins
+    ):
+        if true_class == predicted_class:
+            continue
+        key = (int(true_class), int(predicted_class))
+        item = pairs.setdefault(
+            key,
+            {
+                "true_class": int(true_class),
+                "predicted_class": int(predicted_class),
+                "true_task_age": int(age),
+                "predicted_task_age": int(pred_age),
+                "count": 0,
+                "margins": [],
+            },
+        )
+        if item["true_task_age"] != int(age) or item["predicted_task_age"] != int(pred_age):
+            raise AssertionError("H035 pair task ages changed for a directed class pair")
+        item["count"] += 1
+        item["margins"].append(float(margin))
+    error_count = int(np.sum(predicted != labels))
+    if sum(item["count"] for item in pairs.values()) != error_count:
+        raise AssertionError("H035 confusion pairs do not conserve official errors")
+    records = []
+    for key in sorted(pairs):
+        item = pairs[key]
+        margins_for_pair = np.asarray(item.pop("margins"), dtype=np.float64)
+        item["margin_summary"] = {
+            "mean": float(np.mean(margins_for_pair)),
+            "p95": _h035_percentile(margins_for_pair, 95),
+        }
+        records.append(item)
+    return records, error_count
+
+
+def _h035_top_pair_statistics(task_pairs, final_pairs, final_error_count):
+    import numpy as np
+
+    aggregate = {}
+    recurrence = {}
+    for task_record in task_pairs:
+        seen = set()
+        for pair in task_record["pairs"]:
+            key = (pair["true_class"], pair["predicted_class"])
+            aggregate[key] = aggregate.get(key, 0) + int(pair["count"])
+            seen.add(key)
+        for key in seen:
+            recurrence[key] = recurrence.get(key, 0) + 1
+    ordered = sorted(aggregate, key=lambda key: (-aggregate[key], key[0], key[1]))
+    top_keys = ordered[:20]
+    final_counts = {
+        (pair["true_class"], pair["predicted_class"]): int(pair["count"])
+        for pair in final_pairs
+    }
+    if final_error_count <= 0:
+        raise RuntimeError("H035 requires at least one final official error for pair coverage")
+    covered = sum(final_counts.get(key, 0) for key in top_keys)
+    coverage = float(covered / final_error_count)
+    if not np.isfinite(coverage):
+        raise FloatingPointError("H035 pair coverage is non-finite")
+    return {
+        "top_20": [
+            {"true_class": int(key[0]), "predicted_class": int(key[1]), "count": int(aggregate[key]), "task_count": int(recurrence[key])}
+            for key in top_keys
+        ],
+        "final_error_count": int(final_error_count),
+        "final_top_20_coverage": coverage,
+        "recurrence_count_at_least_two_tasks": int(sum(recurrence[key] >= 2 for key in aggregate)),
+    }
+
+
+def _h035_synthetic_checks():
+    """Focused pure CPU checks for H035 endpoint, ties, quartiles, and counts."""
+    import numpy as np
+
+    vectors = np.asarray([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]], dtype=np.float64)
+    labels = np.asarray([0, 0, 1, 1], dtype=np.int64)
+    centers = np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float64)
+    rows = _h035_exemplar_class_metrics(vectors, labels, centers, 2)
+    if not np.isclose(rows[0]["loo_instability_mean"], 0.0):
+        raise AssertionError("H035 LOO endpoint math check failed")
+    if _h035_spearman([1, 1, 2, 3], [1, 2, 2, 4]) <= 0.0:
+        raise AssertionError("H035 tied Spearman check failed")
+    quartiles = _h035_quartile_partition([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
+    if quartiles["bottom"].tolist() != [0, 1] or quartiles["top"].tolist() != [6, 7]:
+        raise AssertionError("H035 quartile partition check failed")
+    tied_quartiles = _h035_quartile_partition([1.0, 1.0, 1.0, 1.0], [3, 2, 1, 0])
+    if tied_quartiles["bottom"].tolist() != [3] or tied_quartiles["top"].tolist() != [0]:
+        raise AssertionError("H035 tied quartile partition check failed")
+    pair_task0, errors0 = _h035_confusion_pairs([0, 1, 2], [1, 1, 0], [-1.0, 0.1, -0.2], [2, 1])
+    pair_task1, errors1 = _h035_confusion_pairs([0, 1, 2], [1, 0, 0], [-1.0, -0.1, 0.1], [2, 1])
+    stats = _h035_top_pair_statistics(
+        [{"task": 0, "pairs": pair_task0}, {"task": 1, "pairs": pair_task1}],
+        pair_task1,
+        errors1,
+    )
+    if errors0 != 2 or errors1 != 3 or stats["recurrence_count_at_least_two_tasks"] != 2:
+        raise AssertionError("H035 pair conservation/recurrence check failed")
+    return {
+        "loo_endpoint_math": True,
+        "spearman_ties": True,
+        "quartile_partition": True,
+        "pair_coverage_recurrence": True,
+        "conservation": True,
+    }
+
+
+def _h035_memory_vectors(learner, data_manager):
+    import numpy as np
+    from torch.utils.data import DataLoader
+
+    memory_data = np.asarray(learner._data_memory)
+    memory_targets = np.asarray(learner._targets_memory, dtype=np.int64)
+    if memory_data.ndim == 0 or memory_targets.ndim != 1 or len(memory_data) != len(memory_targets):
+        raise RuntimeError("H035 rehearsal memory arrays have incompatible shapes")
+    if len(memory_data) == 0:
+        raise RuntimeError("H035 rehearsal memory is empty")
+    dataset = data_manager.get_dataset(
+        [], source="train", mode="test", appendent=(memory_data, memory_targets)
+    )
+    loader = DataLoader(dataset, batch_size=256, shuffle=False, num_workers=0)
+    vectors, labels = _h033_extract_normalized(learner, loader)
+    if len(vectors) != len(memory_data) or not np.array_equal(labels, memory_targets):
+        raise AssertionError("H035 memory loader changed deterministic exemplar order")
+    return vectors, labels
+
+
+def _h035_record(learner, data_manager, test_vectors, test_labels, official_centers, official_metrics, full_centers):
+    import numpy as np
+
+    if not hasattr(learner, "_h035_measurements"):
+        learner._h035_measurements = []
+        learner._h035_invariance_checks = []
+        learner._h035_synthetic_checks = _h035_synthetic_checks()
+    expected_task = len(learner._h035_measurements)
+    if learner._cur_task != expected_task:
+        raise AssertionError("H035 duplicate/missing/out-of-order task: expected {}, got {}".format(expected_task, learner._cur_task))
+    rng_before = _h033_rng_snapshot()
+    state_before = _h033_state_digests(learner)
+    mode_before = bool(learner._network.training)
+    increments = [int(value) for value in data_manager._increments[: learner._cur_task + 1]]
+    if sum(increments) != learner._total_classes:
+        raise RuntimeError("H035 task increments do not match seen classes")
+    final_task = learner._cur_task == data_manager.nb_tasks - 1
+    try:
+        memory_vectors, memory_labels = _h035_memory_vectors(learner, data_manager)
+        uncertainty = _h035_exemplar_class_metrics(
+            memory_vectors, memory_labels, official_centers, learner._total_classes
+        )
+        pairs, official_error_count = _h035_confusion_pairs(
+            test_labels, official_metrics["predicted"], official_metrics["margin"], increments
+        )
+        measurement = {
+            "task": int(learner._cur_task),
+            "known_classes": int(learner._known_classes),
+            "total_classes": int(learner._total_classes),
+            "uncertainty": uncertainty,
+            "official_error_count": official_error_count,
+            "official_confusion_pairs": pairs,
+        }
+        learner._h035_measurements.append(measurement)
+        if final_task:
+            if len(learner._h035_measurements) != data_manager.nb_tasks:
+                raise AssertionError("H035 did not record exactly one measurement per task")
+            final_uncertainty = learner._h035_measurements[-1]["uncertainty"]
+            final_error = official_metrics["predicted"] != test_labels
+            old_only_centers = _h034_interpolate_centers(
+                official_centers, full_centers, 0.5, learner._known_classes, True
+            )
+            old_only_metrics = _h033_distance_metrics(test_vectors, test_labels, old_only_centers)
+            h034_candidates = learner._h034_measurements[-1]["variants"]["old_only"]
+            h034_alpha05 = next(candidate for candidate in h034_candidates if candidate["alpha"] == 0.5)
+            alpha05_accuracy = float(1.0 - np.mean(old_only_metrics["predicted"] != test_labels))
+            if not np.isclose(
+                alpha05_accuracy,
+                h034_alpha05["groups"]["aggregate"]["accuracy"],
+                rtol=0.0,
+                atol=1e-15,
+            ):
+                raise AssertionError("H035 old_only alpha=0.5 semantics disagree with H034")
+            corrected = final_error & ~(old_only_metrics["predicted"] != test_labels)
+            harmed = ~final_error & (old_only_metrics["predicted"] != test_labels)
+            per_class_transitions = []
+            transition_counts = {}
+            for class_id in range(learner._total_classes):
+                mask = test_labels == class_id
+                per_class_transitions.append(
+                    {
+                        "class": int(class_id),
+                        "official_errors": int(np.sum(mask & final_error)),
+                        "corrected": int(np.sum(mask & corrected)),
+                        "harmed": int(np.sum(mask & harmed)),
+                    }
+                )
+            for official_prediction, alpha_prediction in zip(
+                official_metrics["predicted"], old_only_metrics["predicted"]
+            ):
+                key = (int(official_prediction), int(alpha_prediction))
+                item = transition_counts.setdefault(key, {"official_predicted": key[0], "alpha_predicted": key[1], "count": 0})
+                item["count"] += 1
+            transitions = [transition_counts[key] for key in sorted(transition_counts)]
+            class_by_id = {row["class"]: row for row in per_class_transitions}
+            class_records = []
+            for row in final_uncertainty:
+                class_id = row["class"]
+                test_count = int(np.sum(test_labels == class_id))
+                official_errors = int(np.sum((test_labels == class_id) & final_error))
+                enriched = dict(row)
+                enriched.update(class_by_id[class_id])
+                enriched["test_count"] = test_count
+                enriched["official_error_rate"] = float(official_errors / test_count)
+                class_records.append(enriched)
+            metric_names = (
+                "dispersion_mean",
+                "dispersion_p95",
+                "loo_instability_mean",
+                "loo_instability_p95",
+                "center_norm_before_normalization",
+            )
+            correlations = []
+            for metric_name in metric_names:
+                metric_values = [row[metric_name] for row in class_records]
+                correlations.append(
+                    {
+                        "metric": metric_name,
+                        "rho_official_error_rate": _h035_spearman(metric_values, [row["official_error_rate"] for row in class_records]),
+                        "rho_harmed_count": _h035_spearman(metric_values, [row["harmed"] for row in class_records]),
+                    }
+                )
+            quartiles = {}
+            for metric_name in _H035_PRIMARY_METRICS:
+                metric_values = np.asarray([row[metric_name] for row in class_records], dtype=np.float64)
+                partition = _h035_quartile_partition(metric_values, np.asarray([row["class"] for row in class_records]))
+                bottom = partition["bottom"]
+                top = partition["top"]
+                bottom_count = sum(class_records[index]["test_count"] for index in bottom)
+                top_count = sum(class_records[index]["test_count"] for index in top)
+                bottom_errors = sum(class_records[index]["official_errors"] for index in bottom)
+                top_errors = sum(class_records[index]["official_errors"] for index in top)
+                bottom_rate = float(bottom_errors / bottom_count)
+                top_rate = float(top_errors / top_count)
+                ratio = float(top_rate / bottom_rate) if bottom_rate > 0.0 else float("inf")
+                if not np.isfinite(ratio):
+                    raise FloatingPointError("H035 quartile error-rate ratio is non-finite")
+                quartiles[metric_name] = {
+                    "bottom_classes": [int(class_records[index]["class"]) for index in bottom],
+                    "top_classes": [int(class_records[index]["class"]) for index in top],
+                    "bottom_pooled_error_rate": bottom_rate,
+                    "top_pooled_error_rate": top_rate,
+                    "top_to_bottom_error_rate_ratio": ratio,
+                }
+            pair_stats = _h035_top_pair_statistics(
+                learner._h035_measurements,
+                pairs,
+                official_error_count,
+            )
+            uncertainty_actionable = any(
+                next(item for item in correlations if item["metric"] == metric)["rho_official_error_rate"] >= 0.5
+                and quartiles[metric]["top_to_bottom_error_rate_ratio"] >= 1.5
+                for metric in _H035_PRIMARY_METRICS
+            )
+            pair_actionable = (
+                pair_stats["final_top_20_coverage"] >= 0.20
+                and pair_stats["recurrence_count_at_least_two_tasks"] >= 10
+            )
+            artifact = {
+                "schema": "openresearch.h035-exemplar-uncertainty.v1",
+                "hypothesis": "stored-exemplar uncertainty and recurring directed confusion pairs identify actionable prototype-side diagnosis",
+                "protocol": {
+                    "model": "iCaRL",
+                    "convnet": "resnet18",
+                    "memory_size": 6000,
+                    "seed": 1993,
+                    "uncertainty_loader": "rehearsal memory only; mode=test; shuffle=False; num_workers=0",
+                    "normalization": "NumPy (vectors.T / (norm(vectors.T, axis=0) + EPSILON)).T",
+                    "full_train_usage": "none for uncertainty; H034 full-train centers only reproduce old_only alpha=0.5",
+                },
+                "metric_definitions": {
+                    "dispersion_mean": "mean squared distance of normalized exemplars to normalized official exemplar center",
+                    "dispersion_p95": "p95 squared distance to normalized official exemplar center",
+                    "loo_instability_mean": "mean LOO prototype squared distance to all-exemplar center",
+                    "loo_instability_p95": "p95 LOO prototype squared distance to all-exemplar center",
+                    "loo_cosine_mean": "mean LOO prototype cosine to all-exemplar center",
+                    "center_norm_before_normalization": "norm of the all-exemplar mean before normalization",
+                    "official_confusion_pair": "true class -> predicted class, excluding correct predictions, with task ages and margin summaries",
+                },
+                "preregistration": {
+                    "uncertainty_actionable": "dispersion_mean or loo_instability_mean has Spearman rho >= 0.5 with official error rate and top quartile pooled error rate >= 1.5x bottom",
+                    "pair_structure_actionable": "final top-20 directed pairs cover >=20% of official errors and at least 10 recur in >=2 tasks",
+                    "otherwise": "prototype/center diagnosis exhausted; recommend representation-side decision-local repair",
+                },
+                "measurements": learner._h035_measurements,
+                "final_old_only_alpha_0_5": {
+                    "per_class": class_records,
+                    "transition_pairs": transitions,
+                    "totals": {
+                        "official_error_count": int(np.sum(final_error)),
+                        "corrected": int(np.sum(corrected)),
+                        "harmed": int(np.sum(harmed)),
+                        "transition_count": int(sum(item["count"] for item in transitions)),
+                    },
+                },
+                "finite_statistics": {
+                    "spearman": correlations,
+                    "quartiles": quartiles,
+                    "confusion_pairs": pair_stats,
+                },
+                "invariance_checks": learner._h035_invariance_checks,
+                "synthetic_checks": learner._h035_synthetic_checks,
+                "preregistered_reading": {
+                    "uncertainty_actionable": bool(uncertainty_actionable),
+                    "pair_structure_actionable": bool(pair_actionable),
+                    "prototype_center_diagnosis_exhausted": bool(not uncertainty_actionable and not pair_actionable),
+                    "recommendation": "representation-side decision-local repair" if not uncertainty_actionable and not pair_actionable else "retain prototype/pair structure as actionable diagnostic",
+                },
+                "limitations": [
+                    "uncertainty metrics describe the stored rehearsal memory and do not use full-train samples",
+                    "official confusion pairs are diagnostic summaries, not a causal repair",
+                    "the H034 alpha=0.5 comparison is an oracle diagnostic and does not alter alpha search or deployment",
+                ],
+            }
+            print("H035_EXEMPLAR_UNCERTAINTY_JSON " + json.dumps(artifact, sort_keys=True, separators=(",", ":")), flush=True)
+    finally:
+        if mode_before:
+            learner._network.train()
+        else:
+            learner._network.eval()
+        _h033_restore_rng(rng_before)
+        rng_after = _h033_rng_snapshot()
+        state_after = _h033_state_digests(learner)
+        checks = {
+            "python_numpy_torch_rng_restored": _h033_rng_equal(rng_before, rng_after),
+            "network_state_dict_unchanged": state_before["network_state_dict"] == state_after["network_state_dict"],
+            "fc_parameters_unchanged": state_before["fc_parameters"] == state_after["fc_parameters"],
+            "class_means_unchanged": state_before["class_means"] == state_after["class_means"],
+            "data_memory_unchanged": state_before["data_memory"] == state_after["data_memory"],
+            "targets_memory_unchanged": state_before["targets_memory"] == state_after["targets_memory"],
+        }
+        if not all(checks.values()):
+            raise AssertionError("H035 invariance check failed: {}".format(checks))
+        learner._h035_invariance_checks.append(checks)
+
+
 def _h033_record(learner, data_manager):
     import numpy as np
 
@@ -950,6 +1468,15 @@ def _h033_record(learner, data_manager):
             learner, data_manager, learner._total_classes, test_vectors.shape[1]
         )
         _h034_record(
+            learner,
+            data_manager,
+            test_vectors,
+            test_labels,
+            class_means,
+            official,
+            full_centers,
+        )
+        _h035_record(
             learner,
             data_manager,
             test_vectors,
