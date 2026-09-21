@@ -478,6 +478,438 @@ def _h033_full_centers(learner, data_manager, total_classes, feature_dim):
     return means, dispersion
 
 
+# ---------------------------------------------------------------------------
+# H034: measurement-only center interpolation and confusion-flow telemetry.
+#
+# H034 deliberately consumes the arrays already extracted by H033.  It never
+# invokes the network, data manager, evaluator, optimizer, or replay path, so
+# the added measurements cannot introduce another loader traversal or gradient
+# path.  Full-train centers remain diagnostic oracle information throughout.
+# ---------------------------------------------------------------------------
+
+_H034_ALPHAS = (0.0, 0.25, 0.5, 0.75, 1.0)
+
+
+def _h034_interpolate_centers(official_centers, full_centers, alpha, known_classes, old_only):
+    import numpy as np
+    from models.base import EPSILON
+
+    official_centers = np.asarray(official_centers, dtype=np.float64)
+    full_centers = np.asarray(full_centers, dtype=np.float64)
+    if official_centers.ndim != 2 or official_centers.shape != full_centers.shape:
+        raise RuntimeError("H034 official/full center shapes are incompatible")
+    if not np.isfinite(official_centers).all() or not np.isfinite(full_centers).all():
+        raise FloatingPointError("H034 received non-finite centers")
+    if alpha not in _H034_ALPHAS:
+        raise ValueError("H034 alpha is outside the pre-registered grid: {}".format(alpha))
+    if not 0 <= known_classes <= len(official_centers):
+        raise RuntimeError("H034 known_classes is outside the center range")
+
+    interpolated = official_centers.copy()
+    stop = known_classes if old_only else len(interpolated)
+    interpolated[:stop] = (
+        (1.0 - alpha) * official_centers[:stop] + alpha * full_centers[:stop]
+    )
+    # Use the repository convention requested by the protocol, including its
+    # additive EPSILON.  At alpha=0 this may change center magnitudes by a few
+    # ulps, so exact prediction equality is asserted separately below.
+    interpolated = (
+        interpolated.T
+        / (np.linalg.norm(interpolated.T, axis=0) + EPSILON)
+    ).T
+    if not np.isfinite(interpolated).all():
+        raise FloatingPointError("H034 interpolated centers are non-finite")
+    return interpolated
+
+
+def _h034_task_age_ids(class_ids, increments, total_classes):
+    import numpy as np
+
+    class_ids = np.asarray(class_ids, dtype=np.int64)
+    increments = np.asarray(increments, dtype=np.int64)
+    if increments.ndim != 1 or len(increments) == 0 or np.any(increments <= 0):
+        raise RuntimeError("H034 task increments are invalid")
+    boundaries = np.cumsum(increments)
+    if int(boundaries[-1]) != int(total_classes):
+        raise RuntimeError("H034 task increments do not cover all seen classes")
+    if np.any(class_ids < 0) or np.any(class_ids >= total_classes):
+        raise RuntimeError("H034 class id falls outside the seen-class range")
+    return np.searchsorted(boundaries, class_ids, side="right").astype(np.int64)
+
+
+def _h034_transition_counts(labels, official_predicted, interpolated_predicted, increments):
+    import numpy as np
+
+    labels = np.asarray(labels, dtype=np.int64)
+    official_predicted = np.asarray(official_predicted, dtype=np.int64)
+    interpolated_predicted = np.asarray(interpolated_predicted, dtype=np.int64)
+    if labels.ndim != 1 or official_predicted.shape != labels.shape or interpolated_predicted.shape != labels.shape:
+        raise RuntimeError("H034 transition arrays have incompatible shapes")
+    if len(labels) == 0:
+        raise RuntimeError("H034 cannot summarize empty transition arrays")
+
+    total_classes = int(np.sum(increments))
+    true_age = _h034_task_age_ids(labels, increments, total_classes)
+    official_age = _h034_task_age_ids(official_predicted, increments, total_classes)
+    interpolated_age = _h034_task_age_ids(interpolated_predicted, increments, total_classes)
+    official_correct = official_predicted == labels
+    interpolated_correct = interpolated_predicted == labels
+    corrected_mask = ~official_correct & interpolated_correct
+    harmed_mask = official_correct & ~interpolated_correct
+    both_correct_mask = official_correct & interpolated_correct
+    both_wrong_mask = ~official_correct & ~interpolated_correct
+    changed_mask = official_predicted != interpolated_predicted
+
+    by_true_age = {}
+    flow_sample_total = 0
+    flow_corrected_total = 0
+    flow_harmed_total = 0
+    for age in range(len(increments)):
+        age_mask = true_age == age
+        flows = []
+        for source_age in range(len(increments)):
+            for target_age in range(len(increments)):
+                flow_mask = age_mask & (official_age == source_age) & (interpolated_age == target_age)
+                count = int(np.sum(flow_mask))
+                if count == 0:
+                    continue
+                corrected = int(np.sum(flow_mask & corrected_mask))
+                harmed = int(np.sum(flow_mask & harmed_mask))
+                flows.append(
+                    {
+                        "official_predicted_task_age": int(source_age),
+                        "interpolated_predicted_task_age": int(target_age),
+                        "sample_count": count,
+                        "corrected": corrected,
+                        "harmed": harmed,
+                    }
+                )
+                flow_sample_total += count
+                flow_corrected_total += corrected
+                flow_harmed_total += harmed
+        age_count = int(np.sum(age_mask))
+        if sum(flow["sample_count"] for flow in flows) != age_count:
+            raise AssertionError("H034 task-age prediction flows do not conserve samples")
+        by_true_age["task_{}".format(age)] = {
+            "sample_count": age_count,
+            "corrected": int(np.sum(age_mask & corrected_mask)),
+            "harmed": int(np.sum(age_mask & harmed_mask)),
+            "prediction_age_flows": flows,
+        }
+
+    totals = {
+        "sample_count": int(len(labels)),
+        "prediction_changed": int(np.sum(changed_mask)),
+        "corrected": int(np.sum(corrected_mask)),
+        "harmed": int(np.sum(harmed_mask)),
+        "both_correct": int(np.sum(both_correct_mask)),
+        "both_wrong": int(np.sum(both_wrong_mask)),
+        "wrong_to_different_wrong": int(np.sum(both_wrong_mask & changed_mask)),
+    }
+    if totals["corrected"] + totals["harmed"] + totals["both_correct"] + totals["both_wrong"] != len(labels):
+        raise AssertionError("H034 correctness transitions do not conserve samples")
+    if flow_sample_total != len(labels):
+        raise AssertionError("H034 prediction-age flows do not conserve all samples")
+    if flow_corrected_total != totals["corrected"] or flow_harmed_total != totals["harmed"]:
+        raise AssertionError("H034 prediction-age flow outcomes do not conserve transitions")
+    return {"totals": totals, "by_true_class_task_age": by_true_age}
+
+
+def _h034_measure_variant(
+    test_vectors,
+    test_labels,
+    official_centers,
+    full_centers,
+    official_metrics,
+    known_classes,
+    increments,
+    alpha,
+    old_only,
+    final_task,
+):
+    import numpy as np
+
+    centers = _h034_interpolate_centers(
+        official_centers, full_centers, alpha, known_classes, old_only
+    )
+    metrics = _h033_distance_metrics(test_vectors, test_labels, centers)
+    error = metrics["predicted"] != test_labels
+    if alpha == 0.0 and not np.array_equal(metrics["predicted"], official_metrics["predicted"]):
+        raise AssertionError("H034 alpha=0 predictions disagree with official NME")
+
+    old_mask = test_labels < known_classes
+    groups = {
+        "aggregate": np.ones(len(test_labels), dtype=bool),
+        "old": old_mask,
+        "new": ~old_mask,
+    }
+    measurement = {
+        "alpha": float(alpha),
+        "groups": {
+            name: _h033_sample_summary(
+                mask,
+                metrics["true_distance"],
+                metrics["impostor_distance"],
+                metrics["margin"],
+                error,
+            )
+            for name, mask in groups.items()
+        },
+        "task_age_summaries": {},
+    }
+    lower = 0
+    for age, size in enumerate(increments):
+        upper = lower + size
+        mask = (test_labels >= lower) & (test_labels < upper)
+        measurement["task_age_summaries"]["task_{}".format(age)] = {
+            "class_range": [int(lower), int(upper)],
+            "metrics": _h033_sample_summary(
+                mask,
+                metrics["true_distance"],
+                metrics["impostor_distance"],
+                metrics["margin"],
+                error,
+            ),
+        }
+        lower = upper
+    if lower != len(official_centers):
+        raise RuntimeError("H034 task-age ranges do not cover all centers")
+    if final_task:
+        measurement["final_task_transitions"] = _h034_transition_counts(
+            test_labels, official_metrics["predicted"], metrics["predicted"], increments
+        )
+    return measurement
+
+
+def _h034_synthetic_checks():
+    """Focused CPU checks for interpolation semantics and measurement purity."""
+    import numpy as np
+    from models.base import EPSILON
+
+    official = np.asarray([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float64)
+    full = np.asarray([[0.0, 1.0], [1.0, 0.0], [-1.0, 1.0]], dtype=np.float64)
+    official_before = official.copy()
+    full_before = full.copy()
+    # Construct fixed model-shaped sentinels directly: synthetic checks must
+    # not consume any RNG stream merely by creating a state/gradient fixture.
+    state = {
+        "weight": np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64),
+        "bias": np.asarray([0.5, -0.5], dtype=np.float64),
+    }
+    gradients = {name: None for name in state}
+    state_before = {name: value.copy() for name, value in state.items()}
+    gradients_before = dict(gradients)
+
+    alpha_zero = _h034_interpolate_centers(official, full, 0.0, 1, False)
+    alpha_one = _h034_interpolate_centers(official, full, 1.0, 1, False)
+    old_only = _h034_interpolate_centers(official, full, 1.0, 1, True)
+    expected_zero = official / (np.linalg.norm(official, axis=1, keepdims=True) + EPSILON)
+    expected_one = full / (np.linalg.norm(full, axis=1, keepdims=True) + EPSILON)
+    expected_old_only = official.copy()
+    expected_old_only[0] = full[0]
+    expected_old_only /= np.linalg.norm(expected_old_only, axis=1, keepdims=True) + EPSILON
+    if not np.array_equal(alpha_zero, expected_zero):
+        raise AssertionError("H034 synthetic alpha=0 endpoint check failed")
+    if not np.array_equal(alpha_one, expected_one):
+        raise AssertionError("H034 synthetic alpha=1 endpoint check failed")
+    if not np.array_equal(old_only, expected_old_only):
+        raise AssertionError("H034 synthetic old-only masking check failed")
+    expected_norms = np.linalg.norm(expected_one, axis=1)
+    if not np.array_equal(np.linalg.norm(alpha_one, axis=1), expected_norms):
+        raise AssertionError("H034 synthetic normalization check failed")
+
+    vectors = np.asarray([[0.99, 0.01], [0.01, 0.99], [0.7, 0.7]], dtype=np.float64)
+    labels = np.asarray([0, 1, 2], dtype=np.int64)
+    official_metrics = _h033_distance_metrics(vectors, labels, official)
+    zero_metrics = _h033_distance_metrics(vectors, labels, alpha_zero)
+    if not np.array_equal(zero_metrics["predicted"], official_metrics["predicted"]):
+        raise AssertionError("H034 synthetic alpha=0 prediction check failed")
+
+    transitions = _h034_transition_counts(
+        np.asarray([0, 1, 2, 3]),
+        np.asarray([1, 1, 0, 3]),
+        np.asarray([0, 0, 2, 1]),
+        [2, 2],
+    )
+    if transitions["totals"]["sample_count"] != 4:
+        raise AssertionError("H034 synthetic transition conservation check failed")
+    if sum(
+        group["sample_count"]
+        for group in transitions["by_true_class_task_age"].values()
+    ) != 4:
+        raise AssertionError("H034 synthetic task-age conservation check failed")
+
+    if not np.array_equal(official, official_before) or not np.array_equal(full, full_before):
+        raise AssertionError("H034 synthetic interpolation mutated its inputs")
+    if any(gradients[name] is not gradients_before[name] for name in gradients):
+        raise AssertionError("H034 synthetic check created or changed gradients")
+    if any(not np.array_equal(state[name], value) for name, value in state_before.items()):
+        raise AssertionError("H034 synthetic check changed model state")
+    return {
+        "alpha_endpoints": True,
+        "old_only_masking": True,
+        "normalization": True,
+        "alpha_zero_predictions": True,
+        "transition_count_conservation": True,
+        "gradient_and_state_irrelevance": True,
+    }
+
+
+def _h034_record(
+    learner,
+    data_manager,
+    test_vectors,
+    test_labels,
+    official_centers,
+    official_metrics,
+    full_centers,
+):
+    import numpy as np
+
+    if not hasattr(learner, "_h034_measurements"):
+        learner._h034_measurements = []
+        learner._h034_invariance_checks = []
+        learner._h034_synthetic_checks = _h034_synthetic_checks()
+    expected_task = len(learner._h034_measurements)
+    if learner._cur_task != expected_task:
+        raise AssertionError(
+            "H034 duplicate/missing/out-of-order task: expected {}, got {}".format(
+                expected_task, learner._cur_task
+            )
+        )
+
+    rng_before = _h033_rng_snapshot()
+    state_before = _h033_state_digests(learner)
+    mode_before = bool(learner._network.training)
+    increments = [int(value) for value in data_manager._increments[: learner._cur_task + 1]]
+    if sum(increments) != learner._total_classes:
+        raise RuntimeError("H034 observed increments do not match total_classes")
+    final_task = learner._cur_task == data_manager.nb_tasks - 1
+    variants = {"global": [], "old_only": []}
+    for variant_name, old_only in (("global", False), ("old_only", True)):
+        for alpha in _H034_ALPHAS:
+            variants[variant_name].append(
+                _h034_measure_variant(
+                    test_vectors,
+                    test_labels,
+                    official_centers,
+                    full_centers,
+                    official_metrics,
+                    learner._known_classes,
+                    increments,
+                    alpha,
+                    old_only,
+                    final_task,
+                )
+            )
+
+    record = {
+        "task": int(learner._cur_task),
+        "known_classes": int(learner._known_classes),
+        "total_classes": int(learner._total_classes),
+        "official_nme_accuracy": float(
+            np.mean(official_metrics["predicted"] == test_labels)
+        ),
+        "variants": variants,
+    }
+    if not np.isfinite(record["official_nme_accuracy"]):
+        raise FloatingPointError("H034 official NME accuracy is non-finite")
+    learner._h034_measurements.append(record)
+
+    rng_after = _h033_rng_snapshot()
+    state_after = _h033_state_digests(learner)
+    checks = {
+        "python_numpy_torch_rng_unchanged": _h033_rng_equal(rng_before, rng_after),
+        "network_mode_unchanged": mode_before == bool(learner._network.training),
+        "network_state_dict_unchanged": state_before["network_state_dict"] == state_after["network_state_dict"],
+        "fc_parameters_unchanged": state_before["fc_parameters"] == state_after["fc_parameters"],
+        "class_means_unchanged": state_before["class_means"] == state_after["class_means"],
+        "data_memory_unchanged": state_before["data_memory"] == state_after["data_memory"],
+        "targets_memory_unchanged": state_before["targets_memory"] == state_after["targets_memory"],
+    }
+    if not all(checks.values()):
+        raise AssertionError("H034 invariance check failed: {}".format(checks))
+    learner._h034_invariance_checks.append(checks)
+
+    if not final_task:
+        return
+    observed_tasks = [measurement["task"] for measurement in learner._h034_measurements]
+    expected_tasks = list(range(data_manager.nb_tasks))
+    if observed_tasks != expected_tasks:
+        raise AssertionError(
+            "H034 missing/duplicate tasks: expected {}, got {}".format(
+                expected_tasks, observed_tasks
+            )
+        )
+
+    final_record = learner._h034_measurements[-1]
+    official_accuracy = final_record["official_nme_accuracy"]
+    fixed_candidates = []
+    exploratory_candidates = []
+    for variant_name in ("global", "old_only"):
+        for measurement in final_record["variants"][variant_name]:
+            candidate = {
+                "variant": variant_name,
+                "alpha": measurement["alpha"],
+                "accuracy": measurement["groups"]["aggregate"]["accuracy"],
+            }
+            candidate["accuracy_delta_pp"] = float(
+                (candidate["accuracy"] - official_accuracy) * 100.0
+            )
+            exploratory_candidates.append(candidate)
+            if candidate["alpha"] in (0.25, 0.5, 0.75):
+                fixed_candidates.append(candidate)
+    exploratory_best = max(
+        exploratory_candidates,
+        key=lambda candidate: (candidate["accuracy"], -candidate["alpha"], candidate["variant"] == "global"),
+    )
+    threshold_met = any(
+        candidate["accuracy_delta_pp"] >= 0.5 for candidate in fixed_candidates
+    )
+    artifact = {
+        "schema": "openresearch.h034-center-interpolation.v1",
+        "hypothesis": "fixed partial movement from exemplar centers toward full-train centers exposes usable NME geometry headroom and task-age-asymmetric confusion flow",
+        "protocol": {
+            "model": "iCaRL",
+            "convnet": "resnet18",
+            "memory_size": 6000,
+            "seed": 1993,
+            "alpha_grid": list(_H034_ALPHAS),
+            "global": "interpolate every seen class center",
+            "old_only": "interpolate classes below known_classes; keep current-task centers official",
+            "reuse": "H033 normalized official test embeddings, exemplar centers, and full-train centers; no additional extraction",
+        },
+        "metric_definitions": {
+            "interpolation": "normalize((1-alpha)*official_center+alpha*full_train_center) using repository EPSILON",
+            "squared_distance": "scipy cdist sqeuclidean, matching official NME ordering",
+            "margin": "nearest impostor distance - true-class distance; positive is correct",
+            "prediction_age_flow": "counts indexed by true-class task age, official-predicted task age, and interpolated-predicted task age",
+        },
+        "preregistration": {
+            "geometry_headroom_support": "any fixed partial-interpolation candidate (global or old_only; alpha 0.25, 0.5, or 0.75) reaches final-task official NME +0.5 percentage points",
+            "pure_full_center_endpoint": "alpha=1.0 is an oracle endpoint and is excluded from the support gate",
+            "exploratory_best_alpha": "descriptive and non-deployable because full-train centers are used",
+        },
+        "measurements": learner._h034_measurements,
+        "invariance_checks": learner._h034_invariance_checks,
+        "synthetic_checks": learner._h034_synthetic_checks,
+        "preregistered_reading": {
+            "official_final_task_accuracy": official_accuracy,
+            "support_threshold_pp": 0.5,
+            "fixed_partial_candidates": fixed_candidates,
+            "geometry_headroom_supported": bool(threshold_met),
+            "exploratory_best": exploratory_best,
+        },
+        "limitations": [
+            "every alpha above zero uses full-train centers and is non-deployable diagnostic telemetry",
+            "the best alpha is selected retrospectively and is descriptive, not a validated policy",
+            "center interpolation does not change training and cannot establish a causal repair",
+            "transition flows retain counts and summaries rather than per-sample records",
+        ],
+    }
+    print("H034_CENTER_INTERPOLATION_JSON " + json.dumps(artifact, sort_keys=True, separators=(",", ":")), flush=True)
+
+
 def _h033_record(learner, data_manager):
     import numpy as np
 
@@ -516,6 +948,15 @@ def _h033_record(learner, data_manager):
 
         full_centers, dispersion = _h033_full_centers(
             learner, data_manager, learner._total_classes, test_vectors.shape[1]
+        )
+        _h034_record(
+            learner,
+            data_manager,
+            test_vectors,
+            test_labels,
+            class_means,
+            official,
+            full_centers,
         )
         full = _h033_distance_metrics(test_vectors, test_labels, full_centers)
         old_mask = test_labels < learner._known_classes
