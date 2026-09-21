@@ -1127,7 +1127,7 @@ def _h035_top_pair_statistics(task_pairs, final_pairs, final_error_count):
     recurrence = {}
     for task_record in task_pairs:
         seen = set()
-        for pair in task_record["pairs"]:
+        for pair in task_record["official_confusion_pairs"]:
             key = (pair["true_class"], pair["predicted_class"])
             aggregate[key] = aggregate.get(key, 0) + int(pair["count"])
             seen.add(key)
@@ -1198,11 +1198,17 @@ def _h035_synthetic_checks():
         for index in range(19)
     ]
     task_pairs = [
-        {"task": 0, "pairs": [historical_pair, low_final_pair, recurring_final_pair]},
-        {"task": 1, "pairs": [historical_pair, low_final_pair, recurring_final_pair]},
-        {"task": 2, "pairs": [low_final_pair, recurring_final_pair] + other_final_pairs},
+        {"task": 0, "official_confusion_pairs": [historical_pair, low_final_pair, recurring_final_pair]},
+        {"task": 1, "official_confusion_pairs": [historical_pair, low_final_pair, recurring_final_pair]},
+        {"task": 2, "official_confusion_pairs": [low_final_pair, recurring_final_pair] + other_final_pairs},
     ]
     final_pairs = [low_final_pair, recurring_final_pair] + other_final_pairs
+    try:
+        _h035_top_pair_statistics([{"task": 0}], final_pairs, sum(pair["count"] for pair in final_pairs))
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("H035 pair statistics accepted a task record without official_confusion_pairs")
     stats = _h035_top_pair_statistics(
         task_pairs,
         final_pairs,
