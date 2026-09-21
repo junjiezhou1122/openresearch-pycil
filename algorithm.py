@@ -1,6 +1,27 @@
 """
 Baseline continual learning algorithm: iCaRL on CIFAR-100.
 
+H029 (measurement-only, originalCommit=7f187e7364c0e1a4f825c7c9c47061478e3c249b)
+tests the descriptive hypothesis that representation drift is concentrated in
+particular ResNet stages as replay introduces new classes.  It runs the H018
+training protocol unchanged (ResNet-18, memory_size=6000, seed=1993), and
+records paired representations between the frozen Task-0 reference and each
+later task.  The fixed probe is the first two test examples, in mapped test
+array order, for each of the 50 base classes (100 samples total); test-mode
+transforms are deterministic (ToTensor + CIFAR-100 normalization).
+
+For every task and layer (conv1, layer1, layer2, layer3, layer4, and the final
+embedding), cosine similarity is the mean per-sample cosine and normalized L2
+is mean ||current-reference||_2 / (||reference||_2 + 1e-8).  Task 0 is the
+identity reference (cosine=1, normalized L2=0).  A compact
+``H029_REPRESENTATION_JSON`` line is emitted after the final task so the remote
+run can preserve the artifact in stdout.  This is instrumentation only: no
+optimizer, loss, replay selection, class schedule, RNG stream, or validation
+semantics are changed.  It does not claim causality, does not add CKA (the
+fixed paired probe is insufficient to justify an additional estimator), and
+does not replace the evaluator's metric; probe coverage and aggregate layer
+summaries remain limitations.
+
 This file contains the epoch and hyperparameter configuration for iCaRL.
 The actual iCaRL implementation is in the PyCIL repository (models/icarl.py).
 
@@ -11,6 +32,175 @@ with a different continual learning algorithm from PyCIL (e.g., 'der', 'foster',
 To make deeper changes, agents can also modify models/icarl.py directly,
 but must keep the BaseLearner interface (incremental_train, eval_task, after_task).
 """
+
+import json
+
+
+_H029_ORIGINAL_COMMIT = "7f187e7364c0e1a4f825c7c9c47061478e3c249b"
+_H029_PATCH_INSTALLED = False
+
+
+def _h029_probe(data_manager, per_class=2):
+    """Build the fixed, deterministic probe without touching training RNG."""
+    import numpy as np
+    import torch
+
+    if data_manager.dataset_name.lower() != "cifar100":
+        raise ValueError("H029 requires the CIFAR-100 H018 protocol")
+    targets = np.asarray(data_manager._test_targets)
+    selected = []
+    for class_id in range(50):
+        class_indices = np.flatnonzero(targets == class_id)
+        if len(class_indices) < per_class:
+            raise RuntimeError(
+                "H029 probe class {} has {} samples; need {}".format(
+                    class_id, len(class_indices), per_class
+                )
+            )
+        selected.extend(class_indices[:per_class].tolist())
+    raw_data = np.asarray(data_manager._test_data)[selected]
+    raw_targets = targets[selected]
+    # get_dataset applies only the deterministic test transform here.  Passing
+    # appendent avoids traversing any additional samples or sampling indices.
+    probe_dataset = data_manager.get_dataset(
+        [], source="test", mode="test", appendent=(raw_data, raw_targets)
+    )
+    inputs = torch.stack([probe_dataset[i][1] for i in range(len(probe_dataset))])
+    return inputs, torch.as_tensor(raw_targets, dtype=torch.long)
+
+
+def _h029_features(network, inputs, device, batch_size=32):
+    """Extract paired layer activations while restoring the model's mode."""
+    import torch
+    from torch import nn
+
+    if isinstance(network, nn.DataParallel):
+        network = network.module
+    if not hasattr(network, "convnet"):
+        raise RuntimeError("H029 expected an IncrementalNet with a convnet")
+    convnet = network.convnet
+    if not all(hasattr(convnet, name) for name in ("conv1", "layer1", "layer2", "layer3", "layer4")):
+        raise RuntimeError("H029 requires the ResNet-18 conv1/layer1..layer4 path")
+
+    captured_conv1 = []
+
+    def capture_conv1(_module, _args, output):
+        captured_conv1.append(output.detach().cpu())
+
+    hook = convnet.conv1.register_forward_hook(capture_conv1)
+    was_training = network.training
+    network.eval()
+    outputs = {name: [] for name in ("conv1", "layer1", "layer2", "layer3", "layer4", "final_embedding")}
+    try:
+        with torch.no_grad():
+            for start in range(0, len(inputs), batch_size):
+                batch = inputs[start : start + batch_size].to(device)
+                result = network(batch)
+                if not captured_conv1:
+                    raise RuntimeError("H029 conv1 hook did not observe a forward pass")
+                outputs["conv1"].append(captured_conv1.pop(0))
+                fmaps = result.get("fmaps")
+                if fmaps is None or len(fmaps) != 4:
+                    raise RuntimeError("H029 expected four ResNet feature maps")
+                for name, fmap in zip(("layer1", "layer2", "layer3", "layer4"), fmaps):
+                    outputs[name].append(fmap.detach().cpu())
+                outputs["final_embedding"].append(result["features"].detach().cpu())
+    finally:
+        hook.remove()
+        if was_training:
+            network.train()
+
+    return {
+        name: torch.cat(chunks, dim=0).reshape(len(inputs), -1).float()
+        for name, chunks in outputs.items()
+    }
+
+
+def _h029_metrics(reference, current):
+    from torch.nn import functional as F
+
+    metrics = {}
+    for layer in reference:
+        ref = reference[layer]
+        cur = current[layer]
+        if ref.shape != cur.shape:
+            raise RuntimeError(
+                "H029 representation shape changed for {}: {} vs {}".format(
+                    layer, tuple(ref.shape), tuple(cur.shape)
+                )
+            )
+        cosine = F.cosine_similarity(ref, cur, dim=1, eps=1e-8).mean().item()
+        normalized_l2 = ((ref - cur).norm(dim=1) / (ref.norm(dim=1) + 1e-8)).mean().item()
+        metrics[layer] = {
+            "cosine_similarity": float(cosine),
+            "normalized_l2": float(normalized_l2),
+        }
+    return metrics
+
+
+def _h029_record(self, data_manager):
+    if self.args.get("convnet_type", "").lower() != "resnet18":
+        raise ValueError("H029 is registered only for the H018 ResNet-18 protocol")
+    if not hasattr(self, "_h029_probe_inputs"):
+        self._h029_probe_inputs, self._h029_probe_targets = _h029_probe(data_manager)
+        self._h029_measurements = []
+        self._h029_reference = None
+    current = _h029_features(self._network, self._h029_probe_inputs, self._device)
+    if self._h029_reference is None:
+        self._h029_reference = {name: value.clone() for name, value in current.items()}
+    metrics = _h029_metrics(self._h029_reference, current)
+    self._h029_measurements.append(
+        {
+            "task": int(self._cur_task),
+            "known_classes": int(self._known_classes),
+            "total_classes": int(self._total_classes),
+            "layers": metrics,
+        }
+    )
+    if self._cur_task == data_manager.nb_tasks - 1:
+        artifact = {
+            "schema": "openresearch.h029-representation-drift.v1",
+            "hypothesis": "post-Task-0 representation drift is stage-local under replay",
+            "originalCommit": _H029_ORIGINAL_COMMIT,
+            "protocol": {
+                "model": "iCaRL",
+                "convnet": "resnet18",
+                "memory_size": 6000,
+                "seed": 1993,
+                "probe": "first 2 mapped test samples per base class (classes 0-49)",
+                "probe_size": int(len(self._h029_probe_inputs)),
+            },
+            "metrics": {
+                "cosine_similarity": "mean per-sample cosine(reference,current)",
+                "normalized_l2": "mean ||current-reference||_2/(||reference||_2+1e-8)",
+                "cka": "not computed; bounded paired probe does not justify it",
+            },
+            "measurements": self._h029_measurements,
+            "limitations": [
+                "probe covers only two deterministic test samples per base class",
+                "metrics are descriptive and do not establish causal layer-wise forgetting",
+                "instrumentation does not alter or replace validation metrics",
+            ],
+        }
+        print("H029_REPRESENTATION_JSON " + json.dumps(artifact, sort_keys=True, separators=(",", ":")), flush=True)
+
+
+def _install_h029_instrumentation():
+    """Patch only the iCaRL post-training call; training code remains unchanged."""
+    global _H029_PATCH_INSTALLED
+    if _H029_PATCH_INSTALLED:
+        return
+    from models.icarl import iCaRL
+
+    original_incremental_train = iCaRL.incremental_train
+
+    def instrumented_incremental_train(self, data_manager):
+        result = original_incremental_train(self, data_manager)
+        _h029_record(self, data_manager)
+        return result
+
+    iCaRL.incremental_train = instrumented_incremental_train
+    _H029_PATCH_INSTALLED = True
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +246,7 @@ def get_pycil_config():
     - convnet_type: Backbone architecture
     - Other hyperparameters specific to the chosen model
     """
-    return {
+    config = {
         "prefix": "benchmark",
         "dataset": "cifar100",
         "memory_size": 6000,   # H018: third budget point (baseline 2000, H013 = 4000)
@@ -86,3 +276,8 @@ def get_pycil_config():
         "batch_size": 128,
         "weight_decay": 0.0002,
     }
+    # The evaluator imports this adapter before importing models.icarl.  Install
+    # the post-training observer at that boundary while leaving all H018 values
+    # and the iCaRL training implementation untouched.
+    _install_h029_instrumentation()
+    return config
