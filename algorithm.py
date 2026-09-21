@@ -1133,26 +1133,34 @@ def _h035_top_pair_statistics(task_pairs, final_pairs, final_error_count):
             seen.add(key)
         for key in seen:
             recurrence[key] = recurrence.get(key, 0) + 1
-    ordered = sorted(aggregate, key=lambda key: (-aggregate[key], key[0], key[1]))
-    top_keys = ordered[:20]
     final_counts = {
         (pair["true_class"], pair["predicted_class"]): int(pair["count"])
         for pair in final_pairs
     }
     if final_error_count <= 0:
         raise RuntimeError("H035 requires at least one final official error for pair coverage")
+    # The protocol ranks only directed pairs observed on the final task.  A
+    # pair can be historically frequent yet absent from the final task and
+    # therefore must not enter the final top-20 or inflate recurrence.
+    top_keys = sorted(final_counts, key=lambda key: (-final_counts[key], key[0], key[1]))[:20]
     covered = sum(final_counts.get(key, 0) for key in top_keys)
     coverage = float(covered / final_error_count)
     if not np.isfinite(coverage):
         raise FloatingPointError("H035 pair coverage is non-finite")
     return {
         "top_20": [
-            {"true_class": int(key[0]), "predicted_class": int(key[1]), "count": int(aggregate[key]), "task_count": int(recurrence[key])}
+            {
+                "true_class": int(key[0]),
+                "predicted_class": int(key[1]),
+                "final_count": int(final_counts[key]),
+                "cumulative_count": int(aggregate.get(key, 0)),
+                "task_count": int(recurrence.get(key, 0)),
+            }
             for key in top_keys
         ],
         "final_error_count": int(final_error_count),
         "final_top_20_coverage": coverage,
-        "recurrence_count_at_least_two_tasks": int(sum(recurrence[key] >= 2 for key in aggregate)),
+        "recurrence_count_at_least_two_tasks": int(sum(recurrence.get(key, 0) >= 2 for key in top_keys)),
     }
 
 
@@ -1176,12 +1184,40 @@ def _h035_synthetic_checks():
         raise AssertionError("H035 tied quartile partition check failed")
     pair_task0, errors0 = _h035_confusion_pairs([0, 1, 2], [1, 1, 0], [-1.0, 0.1, -0.2], [2, 1])
     pair_task1, errors1 = _h035_confusion_pairs([0, 1, 2], [1, 0, 0], [-1.0, -0.1, 0.1], [2, 1])
+    # A historically frequent pair is absent from the final task.  The final
+    # ranking must be driven by final counts, and recurrence must be restricted
+    # to the selected final top-20 keys.
+    historical_pair = {"true_class": 0, "predicted_class": 9, "count": 50}
+    # This pair has a low final count and a large historical count.  It is
+    # deliberately keyed after 19 other one-count final pairs so it falls
+    # outside the final top-20 despite its cumulative frequency.
+    low_final_pair = {"true_class": 99, "predicted_class": 99, "count": 1}
+    recurring_final_pair = {"true_class": 1, "predicted_class": 2, "count": 2}
+    other_final_pairs = [
+        {"true_class": index, "predicted_class": 10, "count": 1}
+        for index in range(19)
+    ]
+    task_pairs = [
+        {"task": 0, "pairs": [historical_pair, low_final_pair, recurring_final_pair]},
+        {"task": 1, "pairs": [historical_pair, low_final_pair, recurring_final_pair]},
+        {"task": 2, "pairs": [low_final_pair, recurring_final_pair] + other_final_pairs},
+    ]
+    final_pairs = [low_final_pair, recurring_final_pair] + other_final_pairs
     stats = _h035_top_pair_statistics(
-        [{"task": 0, "pairs": pair_task0}, {"task": 1, "pairs": pair_task1}],
-        pair_task1,
-        errors1,
+        task_pairs,
+        final_pairs,
+        sum(pair["count"] for pair in final_pairs),
     )
-    if errors0 != 2 or errors1 != 3 or stats["recurrence_count_at_least_two_tasks"] != 2:
+    if errors0 != 2 or errors1 != 3:
+        raise AssertionError("H035 pair conservation check failed")
+    if stats["top_20"][0]["true_class"] != 1 or stats["top_20"][0]["final_count"] != 2:
+        raise AssertionError("H035 final-count pair ranking check failed")
+    top_keys = {(row["true_class"], row["predicted_class"]) for row in stats["top_20"]}
+    if (historical_pair["true_class"], historical_pair["predicted_class"]) in top_keys:
+        raise AssertionError("H035 historical-only pair entered final top-20")
+    if (low_final_pair["true_class"], low_final_pair["predicted_class"]) in top_keys:
+        raise AssertionError("H035 low-final-count pair entered final top-20")
+    if stats["recurrence_count_at_least_two_tasks"] != 1:
         raise AssertionError("H035 pair conservation/recurrence check failed")
     return {
         "loo_endpoint_math": True,
@@ -1229,6 +1265,7 @@ def _h035_record(learner, data_manager, test_vectors, test_labels, official_cent
     if sum(increments) != learner._total_classes:
         raise RuntimeError("H035 task increments do not match seen classes")
     final_task = learner._cur_task == data_manager.nb_tasks - 1
+    pending_artifact = None
     try:
         memory_vectors, memory_labels = _h035_memory_vectors(learner, data_manager)
         uncertainty = _h035_exemplar_class_metrics(
@@ -1350,7 +1387,7 @@ def _h035_record(learner, data_manager, test_vectors, test_labels, official_cent
                 pair_stats["final_top_20_coverage"] >= 0.20
                 and pair_stats["recurrence_count_at_least_two_tasks"] >= 10
             )
-            artifact = {
+            pending_artifact = {
                 "schema": "openresearch.h035-exemplar-uncertainty.v1",
                 "hypothesis": "stored-exemplar uncertainty and recurring directed confusion pairs identify actionable prototype-side diagnosis",
                 "protocol": {
@@ -1406,7 +1443,6 @@ def _h035_record(learner, data_manager, test_vectors, test_labels, official_cent
                     "the H034 alpha=0.5 comparison is an oracle diagnostic and does not alter alpha search or deployment",
                 ],
             }
-            print("H035_EXEMPLAR_UNCERTAINTY_JSON " + json.dumps(artifact, sort_keys=True, separators=(",", ":")), flush=True)
     finally:
         if mode_before:
             learner._network.train()
@@ -1426,6 +1462,25 @@ def _h035_record(learner, data_manager, test_vectors, test_labels, official_cent
         if not all(checks.values()):
             raise AssertionError("H035 invariance check failed: {}".format(checks))
         learner._h035_invariance_checks.append(checks)
+        if final_task:
+            if pending_artifact is None:
+                raise RuntimeError("H035 final artifact was not assembled")
+            if data_manager.nb_tasks != 6:
+                raise AssertionError("H035 requires exactly 6 tasks, got {}".format(data_manager.nb_tasks))
+            if len(learner._h035_invariance_checks) != data_manager.nb_tasks:
+                raise AssertionError(
+                    "H035 expected exactly {} invariance checks, got {}".format(
+                        data_manager.nb_tasks, len(learner._h035_invariance_checks)
+                    )
+                )
+            pending_artifact["invariance_checks"] = list(learner._h035_invariance_checks)
+            # Print only after the final task's invariance check has been
+            # validated and appended, so the JSON contains all six checks.
+            print(
+                "H035_EXEMPLAR_UNCERTAINTY_JSON "
+                + json.dumps(pending_artifact, sort_keys=True, separators=(",", ":")),
+                flush=True,
+            )
 
 
 def _h033_record(learner, data_manager):
