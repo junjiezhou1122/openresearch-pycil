@@ -22,6 +22,16 @@ fixed paired probe is insufficient to justify an additional estimator), and
 does not replace the evaluator's metric; probe coverage and aggregate layer
 summaries remain limitations.
 
+H030 adds one bounded causal intervention on top of the H029 checkout. During
+incremental tasks only, replay rows are selected by ``targets < known_classes``
+and compared with the frozen old network at ResNet layer3 and layer4. The
+deterministic POD-style loss squares activations, sums over each spatial axis,
+concatenates the summaries, L2-normalizes each descriptor, and takes the mean
+per-sample L2 distance across those two layers. A fixed conservative coefficient
+of 0.05 is used; new-class rows and final embeddings are not constrained.
+``H030_DIAGNOSTIC_JSON`` reports per-task old-row counts and mean base/KD/POD/
+total losses, while the original H029 representation artifact is unchanged.
+
 This file contains the epoch and hyperparameter configuration for iCaRL.
 The actual iCaRL implementation is in the PyCIL repository (models/icarl.py).
 
@@ -38,6 +48,8 @@ import json
 
 _H029_ORIGINAL_COMMIT = "7f187e7364c0e1a4f825c7c9c47061478e3c249b"
 _H029_PATCH_INSTALLED = False
+_H030_PATCH_INSTALLED = False
+_H030_POD_WEIGHT = 0.05
 
 
 def _h029_probe(data_manager, per_class=2):
@@ -185,10 +197,166 @@ def _h029_record(self, data_manager):
         print("H029_REPRESENTATION_JSON " + json.dumps(artifact, sort_keys=True, separators=(",", ":")), flush=True)
 
 
+def _h030_replay_mask(targets, known_classes):
+    """Return the explicit old-class/replay mask used by H030."""
+    import torch
+
+    if not torch.is_tensor(targets):
+        raise TypeError("H030 targets must be a torch.Tensor")
+    if targets.ndim != 1:
+        raise ValueError("H030 targets must be a 1-D tensor")
+    return targets < int(known_classes) if known_classes > 0 else torch.zeros_like(targets, dtype=torch.bool)
+
+
+def _h030_pod_spatial_loss(current_fmaps, old_fmaps):
+    """Normalized spatial POD distance for matched layer3/layer4 maps."""
+    import torch
+    from torch.nn import functional as F
+
+    if len(current_fmaps) != 2 or len(old_fmaps) != 2:
+        raise ValueError("H030 expects exactly layer3 and layer4 feature maps")
+    layer_losses = []
+    for current, old in zip(current_fmaps, old_fmaps):
+        if current.ndim != 4 or old.ndim != 4 or current.shape != old.shape:
+            raise ValueError("H030 feature-map shapes must match as [N,C,H,W]")
+        current_power = current.pow(2)
+        old_power = old.detach().pow(2)
+        current_descriptor = torch.cat(
+            (current_power.sum(dim=3).flatten(1), current_power.sum(dim=2).flatten(1)), dim=1
+        )
+        old_descriptor = torch.cat(
+            (old_power.sum(dim=3).flatten(1), old_power.sum(dim=2).flatten(1)), dim=1
+        )
+        current_descriptor = F.normalize(current_descriptor, p=2, dim=1)
+        old_descriptor = F.normalize(old_descriptor, p=2, dim=1)
+        layer_losses.append(
+            torch.linalg.vector_norm(current_descriptor - old_descriptor, dim=1).mean()
+        )
+    return torch.stack(layer_losses).mean()
+
+
+def _h030_synthetic_preflight():
+    """CPU-checkable invariants for the mask, POD values, and gradient boundary."""
+    import torch
+
+    targets = torch.tensor([0, 49, 50, 59], dtype=torch.long)
+    mask = _h030_replay_mask(targets, 50)
+    if mask.tolist() != [True, True, False, False]:
+        raise AssertionError("H030 replay mask includes a new-class row")
+    old = [
+        torch.arange(2 * 4 * 4 * 4, dtype=torch.float32).reshape(2, 4, 4, 4) / 17,
+        torch.arange(2 * 8 * 2 * 2, dtype=torch.float32).reshape(2, 8, 2, 2) / 11,
+    ]
+    current = [value.clone().requires_grad_() for value in old]
+    zero = _h030_pod_spatial_loss(current, old)
+    if zero.item() != 0.0:
+        raise AssertionError("H030 identical maps must have zero POD loss")
+    positive = _h030_pod_spatial_loss([current[0] + 0.25, current[1] * 1.1], old)
+    if positive.item() <= 0.0:
+        raise AssertionError("H030 changed maps must have positive POD loss")
+    positive.backward()
+    if any(value.grad is None for value in current) or any(value.grad is not None for value in old):
+        raise AssertionError("H030 gradient boundary is not current-only")
+    return {
+        "mask": mask.tolist(),
+        "zero_pod": float(zero.item()),
+        "positive_pod": float(positive.item()),
+        "current_gradients": True,
+        "old_gradients": False,
+        "pod_weight": _H030_POD_WEIGHT,
+    }
+
+
+def _h030_update_representation(self, train_loader, test_loader, optimizer, scheduler):
+    """Original iCaRL loop with replay-only Layer3/4 POD distillation."""
+    import logging
+    import numpy as np
+    import torch
+    from torch.nn import functional as F
+    from tqdm import tqdm
+    from utils.toolkit import tensor2numpy
+    from models.icarl import T, _KD_loss, epochs
+
+    if self._cur_task == 0:
+        raise RuntimeError("H030 update hook reached task 0")
+    if self._old_network is None:
+        raise RuntimeError("H030 requires frozen old_network on incremental tasks")
+
+    prog_bar = tqdm(range(epochs))
+    total_old_samples = 0
+    summary = {"base": 0.0, "kd": 0.0, "pod": 0.0, "total": 0.0}
+    batches = 0
+    for _, epoch in enumerate(prog_bar):
+        self._network.train()
+        losses = 0.0
+        correct, total = 0, 0
+        for _, (_, inputs, targets) in enumerate(train_loader):
+            inputs, targets = inputs.to(self._device), targets.to(self._device)
+            outputs = self._network(inputs)
+            logits = outputs["logits"]
+            loss_base = F.cross_entropy(logits, targets)
+            with torch.no_grad():
+                old_outputs = self._old_network(inputs)
+            loss_kd = _KD_loss(logits[:, : self._known_classes], old_outputs["logits"], T)
+            old_mask = _h030_replay_mask(targets, self._known_classes)
+            old_count = int(old_mask.sum().item())
+            if old_count:
+                current_old_fmaps = [outputs["fmaps"][2][old_mask], outputs["fmaps"][3][old_mask]]
+                previous_old_fmaps = [old_outputs["fmaps"][2][old_mask], old_outputs["fmaps"][3][old_mask]]
+                loss_pod = _h030_pod_spatial_loss(current_old_fmaps, previous_old_fmaps)
+            else:
+                loss_pod = logits.new_zeros(())
+            loss = loss_base + loss_kd + (_H030_POD_WEIGHT * loss_pod)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            losses += loss.item()
+            summary["base"] += loss_base.item()
+            summary["kd"] += loss_kd.item()
+            summary["pod"] += loss_pod.item()
+            summary["total"] += loss.item()
+            total_old_samples += old_count
+            batches += 1
+
+            _, preds = torch.max(logits, dim=1)
+            correct += preds.eq(targets.expand_as(preds)).cpu().sum()
+            total += len(targets)
+
+        scheduler.step()
+        train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+        if epoch % 5 == 0:
+            test_acc = self._compute_accuracy(self._network, test_loader)
+            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
+                self._cur_task, epoch + 1, epochs, losses / len(train_loader), train_acc, test_acc
+            )
+        else:
+            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}".format(
+                self._cur_task, epoch + 1, epochs, losses / len(train_loader), train_acc
+            )
+        prog_bar.set_description(info)
+    logging.info(info)
+
+    if batches == 0:
+        raise RuntimeError("H030 received an empty incremental train loader")
+    artifact = {
+        "schema": "openresearch.h030-replay-pod.v1",
+        "task": int(self._cur_task),
+        "known_classes": int(self._known_classes),
+        "mask": "targets < known_classes",
+        "layers": ["layer3", "layer4"],
+        "old_sample_count": int(total_old_samples),
+        "batches": int(batches),
+        "pod_weight": _H030_POD_WEIGHT,
+        "loss_mean": {name: value / batches for name, value in summary.items()},
+    }
+    print("H030_DIAGNOSTIC_JSON " + json.dumps(artifact, sort_keys=True, separators=(",", ":")), flush=True)
+
+
 def _install_h029_instrumentation():
     """Patch only the iCaRL post-training call; training code remains unchanged."""
-    global _H029_PATCH_INSTALLED
-    if _H029_PATCH_INSTALLED:
+    global _H029_PATCH_INSTALLED, _H030_PATCH_INSTALLED
+    if _H029_PATCH_INSTALLED and _H030_PATCH_INSTALLED:
         return
     from models.icarl import iCaRL
 
@@ -201,6 +369,9 @@ def _install_h029_instrumentation():
 
     iCaRL.incremental_train = instrumented_incremental_train
     _H029_PATCH_INSTALLED = True
+    if not _H030_PATCH_INSTALLED:
+        iCaRL._update_representation = _h030_update_representation
+        _H030_PATCH_INSTALLED = True
 
 
 # ---------------------------------------------------------------------------
