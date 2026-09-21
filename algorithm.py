@@ -1489,6 +1489,425 @@ def _h035_record(learner, data_manager, test_vectors, test_labels, official_cent
             )
 
 
+# ---------------------------------------------------------------------------
+# H036: measurement-only decision-local layer geometry.
+#
+# This observer deliberately runs after H035 and consumes no training state.
+# Each layer is represented by a deterministic global-average-pooled channel
+# vector (or the ResNet ``features`` vector), normalized with the evaluator's
+# NumPy/EPSILON convention.  Prototypes are built from rehearsal memory only;
+# the official test loader is traversed once per task in deterministic test
+# mode.  No H036 result is used by training or evaluation.
+# ---------------------------------------------------------------------------
+
+_H036_LAYERS = ("conv1", "layer1", "layer2", "layer3", "layer4", "final_embedding")
+_H036_EPSILON = 1e-8
+_H036_PATCH_INSTALLED = False
+
+
+def _h036_normalize_rows(vectors):
+    import numpy as np
+
+    vectors = np.asarray(vectors, dtype=np.float64)
+    if vectors.ndim != 2 or vectors.shape[0] == 0:
+        raise RuntimeError("H036 vectors must be a non-empty matrix")
+    if not np.isfinite(vectors).all():
+        raise FloatingPointError("H036 vectors are non-finite before normalization")
+    normalized = (vectors.T / (np.linalg.norm(vectors.T, axis=0) + _H036_EPSILON)).T
+    if not np.isfinite(normalized).all():
+        raise FloatingPointError("H036 normalized vectors are non-finite")
+    return normalized
+
+
+def _h036_pool_feature(value):
+    import numpy as np
+
+    array = np.asarray(value, dtype=np.float64)
+    if array.ndim == 4:
+        array = np.mean(array, axis=(2, 3))
+    if array.ndim != 2 or array.shape[0] == 0:
+        raise RuntimeError("H036 layer output is not a non-empty channel matrix")
+    if not np.isfinite(array).all():
+        raise FloatingPointError("H036 layer output is non-finite")
+    return _h036_normalize_rows(array)
+
+
+def _h036_extract_layers(learner, loader):
+    """Extract pooled current-ResNet layers from a deterministic loader."""
+    import numpy as np
+    import torch
+    from torch import nn
+
+    network = learner._network.module if isinstance(learner._network, nn.DataParallel) else learner._network
+    convnet = getattr(network, "convnet", None)
+    if convnet is None or not all(hasattr(convnet, name) for name in ("conv1", "layer1", "layer2", "layer3", "layer4")):
+        raise RuntimeError("H036 requires the ResNet-18 conv1/layer1..layer4 path")
+    captured = []
+
+    def capture_conv1(_module, _args, output):
+        captured.append(output.detach().cpu())
+
+    hook = convnet.conv1.register_forward_hook(capture_conv1)
+    was_training = learner._network.training
+    learner._network.eval()
+    outputs = {name: [] for name in _H036_LAYERS}
+    labels = []
+    try:
+        with torch.no_grad():
+            for batch in loader:
+                if len(batch) != 3:
+                    raise RuntimeError("H036 loader batch must contain index, input, target")
+                _, inputs, targets = batch
+                before = len(captured)
+                result = network(inputs.to(learner._device))
+                if len(captured) != before + 1:
+                    raise RuntimeError("H036 conv1 hook did not observe exactly one forward")
+                conv1 = captured.pop(0)
+                fmaps = result.get("fmaps")
+                if fmaps is None or len(fmaps) != 4:
+                    raise RuntimeError("H036 expected four ResNet feature maps")
+                batch_values = {"conv1": conv1}
+                batch_values.update(dict(zip(("layer1", "layer2", "layer3", "layer4"), fmaps)))
+                final = result.get("features")
+                if final is None:
+                    raise RuntimeError("H036 result is missing final_embedding features")
+                batch_values["final_embedding"] = final.detach().cpu()
+                batch_size = int(len(targets))
+                for name in _H036_LAYERS:
+                    value = batch_values[name].numpy()
+                    if value.shape[0] != batch_size:
+                        raise RuntimeError("H036 {} batch size mismatch".format(name))
+                    outputs[name].append(_h036_pool_feature(value))
+                labels.append(np.asarray(targets, dtype=np.int64))
+    finally:
+        hook.remove()
+        if was_training:
+            learner._network.train()
+        else:
+            learner._network.eval()
+    if not labels:
+        raise RuntimeError("H036 deterministic loader yielded no samples")
+    labels = np.concatenate(labels)
+    result = {name: np.concatenate(outputs[name], axis=0) for name in _H036_LAYERS}
+    if any(len(value) != len(labels) for value in result.values()):
+        raise RuntimeError("H036 layer/label counts disagree")
+    return result, labels
+
+
+def _h036_memory_loader(learner, data_manager):
+    import numpy as np
+    from torch.utils.data import DataLoader
+
+    memory_data = np.asarray(learner._data_memory)
+    memory_targets = np.asarray(learner._targets_memory, dtype=np.int64)
+    if memory_data.ndim == 0 or memory_targets.ndim != 1 or len(memory_data) != len(memory_targets):
+        raise RuntimeError("H036 rehearsal memory arrays have incompatible shapes")
+    if len(memory_data) == 0:
+        raise RuntimeError("H036 rehearsal memory is empty")
+    dataset = data_manager.get_dataset([], source="train", mode="test", appendent=(memory_data, memory_targets))
+    return DataLoader(dataset, batch_size=256, shuffle=False, num_workers=0), memory_targets
+
+
+def _h036_prototypes(memory_vectors, memory_labels, total_classes):
+    import numpy as np
+
+    memory_vectors = np.asarray(memory_vectors, dtype=np.float64)
+    memory_labels = np.asarray(memory_labels, dtype=np.int64)
+    if memory_vectors.ndim != 2 or not np.isfinite(memory_vectors).all():
+        raise FloatingPointError("H036 memory vectors are non-finite or malformed")
+    if memory_labels.ndim != 1 or len(memory_vectors) != len(memory_labels):
+        raise RuntimeError("H036 memory vectors/labels have incompatible shapes")
+    if np.any(memory_labels < 0) or np.any(memory_labels >= total_classes):
+        raise RuntimeError("H036 memory label falls outside seen classes")
+    prototypes = []
+    for class_id in range(total_classes):
+        rows = memory_vectors[memory_labels == class_id]
+        if len(rows) == 0:
+            raise RuntimeError("H036 missing rehearsal class {}".format(class_id))
+        center = np.mean(rows, axis=0)
+        center = _h036_normalize_rows(center.reshape(1, -1))[0]
+        prototypes.append(center)
+    result = np.asarray(prototypes, dtype=np.float64)
+    if result.ndim != 2 or not np.isfinite(result).all():
+        raise FloatingPointError("H036 prototypes are non-finite")
+    return result
+
+
+def _h036_distance_metrics(vectors, labels, prototypes):
+    import numpy as np
+    from scipy.spatial.distance import cdist
+
+    vectors = np.asarray(vectors, dtype=np.float64)
+    labels = np.asarray(labels, dtype=np.int64)
+    prototypes = np.asarray(prototypes, dtype=np.float64)
+    if vectors.ndim != 2 or prototypes.ndim != 2 or vectors.shape[1] != prototypes.shape[1]:
+        raise RuntimeError("H036 vector/prototype shapes are incompatible")
+    if labels.ndim != 1 or len(labels) != len(vectors):
+        raise RuntimeError("H036 labels do not match vectors")
+    if np.any(labels < 0) or np.any(labels >= len(prototypes)):
+        raise RuntimeError("H036 labels fall outside prototype range")
+    if not np.isfinite(vectors).all() or not np.isfinite(prototypes).all():
+        raise FloatingPointError("H036 vectors or prototypes are non-finite")
+    distances = cdist(vectors, prototypes, "sqeuclidean")
+    rows = np.arange(len(labels))
+    predicted = np.argsort(distances, axis=1)[:, 0].astype(np.int64, copy=False)
+    true_distance = distances[rows, labels]
+    if not np.isfinite(distances).all():
+        raise FloatingPointError("H036 distances are non-finite")
+    return {"distances": distances, "predicted": predicted, "true_distance": true_distance}
+
+
+def _h036_competitor_classes(test_labels, official_metrics, official_centers):
+    import numpy as np
+    from scipy.spatial.distance import cdist
+
+    labels = np.asarray(test_labels, dtype=np.int64)
+    predicted = np.asarray(official_metrics["predicted"], dtype=np.int64)
+    centers = np.asarray(official_centers, dtype=np.float64)
+    if labels.ndim != 1 or predicted.shape != labels.shape or centers.ndim != 2:
+        raise RuntimeError("H036 official competitor inputs have incompatible shapes")
+    if not np.isfinite(labels).all() or not np.isfinite(predicted).all() or not np.isfinite(centers).all():
+        raise FloatingPointError("H036 official competitor inputs are non-finite")
+    if np.any(labels < 0) or np.any(labels >= len(centers)):
+        raise RuntimeError("H036 official labels fall outside center range")
+    if np.any(predicted < 0) or np.any(predicted >= len(centers)):
+        raise RuntimeError("H036 official predictions fall outside center range")
+    official_vectors = np.asarray(official_metrics["vectors"], dtype=np.float64) if "vectors" in official_metrics else None
+    if official_vectors is None:
+        distances = None
+    else:
+        if official_vectors.ndim != 2 or official_vectors.shape[0] != len(labels) or official_vectors.shape[1] != centers.shape[1]:
+            raise RuntimeError("H036 official vectors/centers have incompatible shapes")
+        if not np.isfinite(official_vectors).all():
+            raise FloatingPointError("H036 official vectors are non-finite")
+        distances = cdist(official_vectors, centers, "sqeuclidean")
+    # Official H033 retains no test vectors in its metric record.  The caller
+    # supplies them separately via ``official_test_vectors`` below.
+    if distances is None:
+        raise RuntimeError("H036 official competitor requires final test vectors")
+    if not np.isfinite(distances).all():
+        raise FloatingPointError("H036 official competitor distances are non-finite")
+    competitors = predicted.copy()
+    correct = predicted == labels
+    if np.any(correct):
+        rows = np.flatnonzero(correct)
+        masked = distances[rows].copy()
+        masked[np.arange(len(rows)), labels[rows]] = np.inf
+        competitors[rows] = np.argsort(masked, axis=1)[:, 0]
+    if np.any(competitors == labels):
+        raise AssertionError("H036 competitor class equals true class")
+    return competitors
+
+
+def _h036_summary(mask, predicted, labels, pair_margin):
+    import numpy as np
+
+    mask = np.asarray(mask, dtype=bool)
+    errors = predicted != labels
+    selected = pair_margin[mask]
+    if len(selected) == 0:
+        return {"count": 0}
+    return {
+        "count": int(mask.sum()),
+        "error_count": int(np.sum(errors[mask])),
+        "error_rate": float(np.mean(errors[mask])),
+        "accuracy": float(1.0 - np.mean(errors[mask])),
+        "pair_margin_mean": float(np.mean(selected)),
+        "pair_margin_percentiles": _h033_percentiles(selected),
+        "pair_margin_positive_count": int(np.sum(selected > 0.0)),
+        "pair_margin_nonpositive_count": int(np.sum(selected <= 0.0)),
+    }
+
+
+def _h036_transition_partition(signs, layer_names):
+    import numpy as np
+
+    signs = np.asarray(signs, dtype=bool)
+    if signs.ndim != 2 or signs.shape[1] != len(layer_names):
+        raise RuntimeError("H036 transition signs have incompatible shape")
+    transitions = []
+    for index in range(len(layer_names) - 1):
+        left, right = signs[:, index], signs[:, index + 1]
+        transitions.append({
+            "from": layer_names[index],
+            "to": layer_names[index + 1],
+            "positive_to_nonpositive": int(np.sum(left & ~right)),
+            "nonpositive_to_positive": int(np.sum(~left & right)),
+            "stable_positive": int(np.sum(left & right)),
+            "stable_nonpositive": int(np.sum(~left & ~right)),
+        })
+    assignments = {"never_positive": 0, "no_final_collapse": 0}
+    for row in signs:
+        positive = np.flatnonzero(row)
+        if len(positive) == 0:
+            assignments["never_positive"] += 1
+            continue
+        collapses = np.flatnonzero(row[:-1] & ~row[1:])
+        if len(collapses) == 0:
+            assignments["no_final_collapse"] += 1
+        else:
+            key = "{}->{}".format(layer_names[collapses[-1]], layer_names[collapses[-1] + 1])
+            assignments[key] = assignments.get(key, 0) + 1
+    if sum(assignments.values()) != len(signs):
+        raise AssertionError("H036 final-error transition partition does not conserve samples")
+    return transitions, assignments
+
+
+def _h036_select_transition(transitions, error_count, last_positive_partition=None):
+    if error_count <= 0:
+        return None
+    if last_positive_partition is None:
+        counts = {"{}->{}".format(row["from"], row["to"]): row["positive_to_nonpositive"] for row in transitions}
+    else:
+        counts = {key: int(value) for key, value in last_positive_partition.items() if "->" in key}
+    eligible = [row for row in transitions if counts.get("{}->{}".format(row["from"], row["to"]), 0) >= 0.10 * error_count]
+    if not eligible:
+        return None
+    # Stable layer-order tie break: transitions are already in registered order.
+    selected = max(eligible, key=lambda row: counts["{}->{}".format(row["from"], row["to"])])
+    return selected["from"] + "->" + selected["to"]
+
+
+def _h036_synthetic_checks():
+    import numpy as np
+
+    pooled = _h036_pool_feature(np.asarray([[[[1.0, 1.0]], [[0.0, 0.0]]]]))
+    if not np.allclose(pooled, [[1.0, 0.0]]):
+        raise AssertionError("H036 pooling/normalization check failed")
+    prototypes = _h036_prototypes(np.asarray([[1.0, 0.0], [0.0, 1.0]]), [0, 1], 2)
+    metrics = _h036_distance_metrics(_h036_normalize_rows([[1.0, 0.0], [0.0, 1.0]]), np.asarray([0, 1]), prototypes)
+    if metrics["predicted"].tolist() != [0, 1]:
+        raise AssertionError("H036 prototype classification check failed")
+    official = {"predicted": np.asarray([1, 0, 0]), "vectors": np.asarray([[0.0, 1.0], [1.0, 0.0], [0.8, 0.2]])}
+    competitors = _h036_competitor_classes(np.asarray([0, 1, 0]), official, np.asarray([[1.0, 0.0], [0.0, 1.0]]))
+    if competitors.tolist() != [1, 0, 1]:
+        raise AssertionError("H036 official competitor semantics check failed")
+    signs = np.asarray([[True, True, False, True, False, False], [False] * 6, [True] * 6])
+    transitions, assignments = _h036_transition_partition(signs, _H036_LAYERS)
+    if sum(assignments.values()) != 3 or transitions[1]["positive_to_nonpositive"] != 1:
+        raise AssertionError("H036 transition conservation check failed")
+    if _h036_select_transition(transitions, 3, assignments) != "layer3->layer4":
+        raise AssertionError("H036 deterministic transition selection check failed")
+    return {"pooling_normalization": True, "prototype_classification": True, "official_competitor": True, "transition_conservation": True, "deterministic_selection": True}
+
+
+def _h036_record(learner, data_manager, test_vectors, test_labels, official_centers, official_metrics):
+    import numpy as np
+
+    if not hasattr(learner, "_h036_measurements"):
+        learner._h036_measurements = []
+        learner._h036_invariance_checks = []
+        learner._h036_synthetic_checks = _h036_synthetic_checks()
+    expected_task = len(learner._h036_measurements)
+    if learner._cur_task != expected_task:
+        raise AssertionError("H036 duplicate/missing/out-of-order task")
+    rng_before = _h033_rng_snapshot()
+    state_before = _h033_state_digests(learner)
+    mode_before = bool(learner._network.training)
+    pending_artifact = None
+    try:
+        memory_loader, memory_targets = _h036_memory_loader(learner, data_manager)
+        memory_layers, observed_memory_labels = _h036_extract_layers(learner, memory_loader)
+        if not np.array_equal(observed_memory_labels, memory_targets):
+            raise AssertionError("H036 memory loader changed deterministic exemplar order")
+        test_layers, observed_test_labels = _h036_extract_layers(learner, learner.test_loader)
+        if not np.array_equal(observed_test_labels, test_labels):
+            raise AssertionError("H036 test labels differ from H033 test_labels")
+        if not np.array_equal(test_labels, np.asarray(test_labels, dtype=np.int64)):
+            raise AssertionError("H036 test labels are not integer class ids")
+        official_predictions = np.asarray(official_metrics["predicted"], dtype=np.int64)
+        official_error = official_predictions != test_labels
+        official_accuracy = float(np.mean(~official_error))
+        if not np.isfinite(official_accuracy):
+            raise FloatingPointError("H036 official accuracy is non-finite")
+        official_payload = {"predicted": official_predictions, "vectors": test_vectors}
+        competitors = _h036_competitor_classes(test_labels, official_payload, official_centers)
+        layer_records = {}
+        predictions = []
+        pair_margins = []
+        for layer in _H036_LAYERS:
+            if test_layers[layer].shape[1] != memory_layers[layer].shape[1]:
+                raise RuntimeError("H036 {} test/memory feature dimensions disagree".format(layer))
+            prototypes = _h036_prototypes(memory_layers[layer], memory_targets, learner._total_classes)
+            metrics = _h036_distance_metrics(test_layers[layer], test_labels, prototypes)
+            if layer == "final_embedding" and not np.array_equal(metrics["predicted"], official_predictions):
+                raise AssertionError("H036 final_embedding predictions disagree with H033 official NME")
+            competitor_distance = metrics["distances"][np.arange(len(test_labels)), competitors]
+            pair_margin = competitor_distance - metrics["true_distance"]
+            if not np.isfinite(pair_margin).all():
+                raise FloatingPointError("H036 pair margin is non-finite")
+            old_mask = test_labels < learner._known_classes
+            groups = {"total": np.ones(len(test_labels), dtype=bool), "old": old_mask, "new": ~old_mask}
+            task_age_summaries = {}
+            lower = 0
+            for age, size in enumerate(data_manager._increments[: learner._cur_task + 1]):
+                upper = lower + int(size)
+                task_age_summaries["task_{}".format(age)] = _h036_summary((test_labels >= lower) & (test_labels < upper), metrics["predicted"], test_labels, pair_margin)
+                lower = upper
+            layer_records[layer] = {
+                "accuracy": float(np.mean(metrics["predicted"] == test_labels)),
+                "error_count": int(np.sum(metrics["predicted"] != test_labels)),
+                "groups": {name: _h036_summary(mask, metrics["predicted"], test_labels, pair_margin) for name, mask in groups.items()},
+                "task_age_summaries": task_age_summaries,
+                "pair_margin": _h036_summary(np.ones(len(test_labels), dtype=bool), metrics["predicted"], test_labels, pair_margin),
+                "comparison_to_official": {
+                    "corrected": int(np.sum(official_error & (metrics["predicted"] == test_labels))),
+                    "harmed": int(np.sum(~official_error & (metrics["predicted"] != test_labels))),
+                    "prediction_changed": int(np.sum(metrics["predicted"] != official_predictions)),
+                },
+            }
+            predictions.append(metrics["predicted"])
+            pair_margins.append(pair_margin)
+        predictions = np.asarray(predictions)
+        pair_margins = np.asarray(pair_margins)
+        error_rows = np.flatnonzero(official_error)
+        signs = pair_margins[:, error_rows].T > 0.0 if len(error_rows) else np.zeros((0, len(_H036_LAYERS)), dtype=bool)
+        transitions, partition = _h036_transition_partition(signs, _H036_LAYERS)
+        for transition in transitions:
+            transition["last_positive_partition_count"] = int(
+                partition.get("{}->{}".format(transition["from"], transition["to"]), 0)
+            )
+        transition_selection = _h036_select_transition(transitions, len(error_rows), partition)
+        final_task = learner._cur_task == data_manager.nb_tasks - 1
+        measurement = {"task": int(learner._cur_task), "known_classes": int(learner._known_classes), "total_classes": int(learner._total_classes), "official_accuracy": official_accuracy, "official_error_count": int(len(error_rows)), "layers": layer_records, "adjacent_transitions": transitions, "final_error_last_positive_partition": partition}
+        learner._h036_measurements.append(measurement)
+        if final_task:
+            if len(learner._h036_measurements) != data_manager.nb_tasks:
+                raise AssertionError("H036 did not record exactly one measurement per task")
+            nonfinal = [layer_records[layer]["accuracy"] for layer in _H036_LAYERS[:-1]]
+            intermediate_supported = any(value >= official_accuracy + 0.005 for value in nonfinal)
+            stage_supported = transition_selection is not None
+            pending_artifact = {
+                "schema": "openresearch.h036-decision-local-geometry.v1",
+                "hypothesis": "decision-local layer geometry can identify intermediate headroom or a stage-local margin collapse",
+                "protocol": {"model": "iCaRL", "convnet": "resnet18", "memory_size": 6000, "seed": 1993, "layers": list(_H036_LAYERS), "memory_loader": "mode=test; shuffle=False; num_workers=0", "normalization": "NumPy (vectors.T / (norm(vectors.T, axis=0) + EPSILON)).T"},
+                "preregistration": {"intermediate_headroom_supported": "any non-final final-task accuracy >= official accuracy + 0.5pp", "stage_local_collapse_supported": "one adjacent transition receives >=10% of final official errors in last-positive partition", "selection": "maximum transition count with registered layer-order tie break", "otherwise": "do not recommend layer-specific repair"},
+                "measurements": learner._h036_measurements,
+                "final_task_reading": {"intermediate_headroom_supported": bool(intermediate_supported), "stage_local_collapse_supported": bool(stage_supported), "selected_transition": transition_selection, "recommendation": ("stage-local repair at {}".format(transition_selection) if stage_supported else ("intermediate headroom" if intermediate_supported else "no layer-specific repair"))},
+                "synthetic_checks": learner._h036_synthetic_checks,
+                "limitations": ["layer summaries are descriptive and do not establish causal repair", "prototypes are rehearsal-only and the official competitor is defined by final-embedding NME", "global average pooling cannot localize spatial causes"],
+            }
+    finally:
+        if mode_before:
+            learner._network.train()
+        else:
+            learner._network.eval()
+        _h033_restore_rng(rng_before)
+        rng_after = _h033_rng_snapshot()
+        state_after = _h033_state_digests(learner)
+        checks = {"python_numpy_torch_rng_restored": _h033_rng_equal(rng_before, rng_after), "network_state_dict_unchanged": state_before["network_state_dict"] == state_after["network_state_dict"], "fc_parameters_unchanged": state_before["fc_parameters"] == state_after["fc_parameters"], "class_means_unchanged": state_before["class_means"] == state_after["class_means"], "data_memory_unchanged": state_before["data_memory"] == state_after["data_memory"], "targets_memory_unchanged": state_before["targets_memory"] == state_after["targets_memory"]}
+        if not all(checks.values()):
+            raise AssertionError("H036 invariance check failed: {}".format(checks))
+        learner._h036_invariance_checks.append(checks)
+        if learner._cur_task == data_manager.nb_tasks - 1:
+            if pending_artifact is None:
+                raise RuntimeError("H036 final artifact was not assembled")
+            if len(learner._h036_invariance_checks) != 6:
+                raise AssertionError("H036 requires exactly six state/RNG checks")
+            pending_artifact["invariance_checks"] = list(learner._h036_invariance_checks)
+            print("H036_DECISION_LOCAL_GEOMETRY_JSON " + json.dumps(pending_artifact, sort_keys=True, separators=(",", ":")), flush=True)
+
+
 def _h033_record(learner, data_manager):
     import numpy as np
 
@@ -1545,6 +1964,14 @@ def _h033_record(learner, data_manager):
             class_means,
             official,
             full_centers,
+        )
+        _h036_record(
+            learner,
+            data_manager,
+            test_vectors,
+            test_labels,
+            class_means,
+            official,
         )
         full = _h033_distance_metrics(test_vectors, test_labels, full_centers)
         old_mask = test_labels < learner._known_classes
