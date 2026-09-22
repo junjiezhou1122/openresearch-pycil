@@ -2369,7 +2369,7 @@ def _h038_synthetic_cpu_test():
 
 
 def _h038_static_contract_check():
-    """Fail fast if the update hook accesses Layer1/2 or final embeddings."""
+    """Fail fast if H038's layer, restoration, and diagnostic contracts drift."""
     import ast
     import inspect
 
@@ -2387,7 +2387,18 @@ def _h038_static_contract_check():
                 final_accesses.append(node)
     if final_accesses or fmap_indices["outputs_fmaps"] != {3} or fmap_indices["old_outputs_fmaps"] != {2}:
         raise AssertionError("H038 must use current Layer4 and frozen Layer3 only")
-    return {"current_feature_map_indices": [3], "teacher_feature_map_indices": [2], "final_embedding_accesses": 0}
+    geometry_source = inspect.getsource(_h038_rehearsal_geometry)
+    required_geometry = ("_h033_rng_snapshot", "_h033_restore_rng", "_h033_rng_equal", "old_network.train(was_training)")
+    if any(fragment not in geometry_source for fragment in required_geometry):
+        raise AssertionError("H038 rehearsal geometry must restore RNG and old-network mode")
+    diagnostic_source = inspect.getsource(_h038_emit_diagnostic)
+    update_source = inspect.getsource(_h038_update_representation)
+    required_diagnostic = ("final_error_last_positive_partition", "capability_evaluated_externally")
+    if any(fragment not in diagnostic_source for fragment in required_diagnostic):
+        raise AssertionError("H038 diagnostic contract is missing H036/external capability fields")
+    if "training_row_summaries" not in update_source:
+        raise AssertionError("H038 training-row counts must remain nested diagnostics")
+    return {"current_feature_map_indices": [3], "teacher_feature_map_indices": [2], "final_embedding_accesses": 0, "rehearsal_rng_mode_frozen_restore": True, "h036_partition_diagnostic": True, "training_row_summaries": True}
 
 
 def _h038_rehearsal_geometry(self):
@@ -2406,16 +2417,21 @@ def _h038_rehearsal_geometry(self):
     memory_targets = torch.as_tensor(memory_targets, dtype=torch.long)
     if len(memory_data) != len(memory_targets) or not bool((memory_targets < self._known_classes).all()):
         raise RuntimeError("H038 replay memory is incompatible with known classes")
-    dataset = data_manager.get_dataset([], source="train", mode="test", appendent=(memory_data, memory_targets.numpy()))
-    loader = DataLoader(dataset, batch_size=256, shuffle=False, num_workers=0)
     old_network = self._old_network.module if isinstance(self._old_network, nn.DataParallel) else self._old_network
     if old_network is None or any(parameter.requires_grad for parameter in old_network.parameters()):
         raise RuntimeError("H038 old network must exist and remain frozen")
+    rng_before = _h033_rng_snapshot()
     state_before = {name: value.detach().cpu().clone() for name, value in old_network.state_dict().items()}
     was_training = old_network.training
-    old_network.eval()
+    frozen_before = {
+        name: bool(parameter.requires_grad)
+        for name, parameter in old_network.named_parameters()
+    }
     vectors3, vectors4, labels = [], [], []
     try:
+        dataset = data_manager.get_dataset([], source="train", mode="test", appendent=(memory_data, memory_targets.numpy()))
+        loader = DataLoader(dataset, batch_size=256, shuffle=False, num_workers=0)
+        old_network.eval()
         with torch.no_grad():
             for _, inputs, targets in loader:
                 result = old_network(inputs.to(self._device))
@@ -2427,9 +2443,24 @@ def _h038_rehearsal_geometry(self):
                 labels.append(targets.to(dtype=torch.long).cpu())
     finally:
         old_network.train(was_training)
-    for name, value in old_network.state_dict().items():
-        if not torch.equal(value.detach().cpu(), state_before[name]):
-            raise AssertionError("H038 frozen old network mutated during prototype construction")
+        _h033_restore_rng(rng_before)
+        rng_after = _h033_rng_snapshot()
+        frozen_after = {
+            name: bool(parameter.requires_grad)
+            for name, parameter in old_network.named_parameters()
+        }
+        state_restored = all(
+            torch.equal(value.detach().cpu(), state_before[name])
+            for name, value in old_network.state_dict().items()
+        )
+        checks = {
+            "python_numpy_torch_rng_restored": _h033_rng_equal(rng_before, rng_after),
+            "old_network_mode_restored": bool(old_network.training) == bool(was_training),
+            "old_network_frozen_state_restored": frozen_after == frozen_before,
+            "old_network_state_unchanged": state_restored,
+        }
+        if not all(checks.values()):
+            raise AssertionError("H038 rehearsal geometry invariance failed: {}".format(checks))
     if not labels:
         raise RuntimeError("H038 deterministic rehearsal loader yielded no rows")
     vectors3, vectors4, labels = torch.cat(vectors3), torch.cat(vectors4), torch.cat(labels)
@@ -2457,7 +2488,7 @@ def _h038_update_representation(self, train_loader, test_loader, optimizer, sche
     if any(parameter.requires_grad for parameter in self._old_network.parameters()):
         raise RuntimeError("H038 old network must be frozen before distillation")
     geometry = _h038_rehearsal_geometry(self)
-    diagnostics = {"task": int(self._cur_task), "known_classes": int(self._known_classes), "total_classes": int(self._total_classes), "epochs": int(icarl_module.epochs), "batches": 0, "samples": 0, "old_class_samples": 0, "new_class_samples": 0, "constrained_samples": 0, "negative_teacher_margin_samples": 0, "collapse_samples": 0, "never_positive_samples": 0, "loss_sum": {"base": 0.0, "kd": 0.0, "margin": 0.0, "total": 0.0}}
+    diagnostics = {"task": int(self._cur_task), "known_classes": int(self._known_classes), "total_classes": int(self._total_classes), "epochs": int(icarl_module.epochs), "batches": 0, "samples": 0, "old_class_samples": 0, "new_class_samples": 0, "constrained_samples": 0, "negative_teacher_margin_samples": 0, "training_row_summaries": {"collapse_samples": 0, "never_positive_samples": 0}, "loss_sum": {"base": 0.0, "kd": 0.0, "margin": 0.0, "total": 0.0}}
     prog_bar = tqdm(range(icarl_module.epochs))
     for _, epoch in enumerate(prog_bar):
         self._network.train()
@@ -2485,8 +2516,8 @@ def _h038_update_representation(self, train_loader, test_loader, optimizer, sche
                 teacher_margin, _, student_margin = _h038_margin_triplet(teacher_layer3, student_layer4, targets[old_mask], geometry["layer3"], geometry["layer4"])
                 loss_margin = _h038_margin_loss(targets[old_mask], teacher_margin, student_margin, self._known_classes)
                 diagnostics["negative_teacher_margin_samples"] += int((teacher_margin < 0).sum().item())
-                diagnostics["collapse_samples"] += int(((teacher_margin > 0) & (student_margin <= 0)).sum().item())
-                diagnostics["never_positive_samples"] += int((teacher_margin <= 0).sum().item())
+                diagnostics["training_row_summaries"]["collapse_samples"] += int(((teacher_margin > 0) & (student_margin <= 0)).sum().item())
+                diagnostics["training_row_summaries"]["never_positive_samples"] += int((teacher_margin <= 0).sum().item())
             loss = loss_base + loss_kd + _H038_MARGIN_COEFFICIENT * loss_margin
             if not bool(torch.isfinite(loss)):
                 raise FloatingPointError("H038 total loss is non-finite")
@@ -2529,16 +2560,29 @@ def _h038_update_representation(self, train_loader, test_loader, optimizer, sche
 def _h038_emit_diagnostic(self, data_manager):
     if self._cur_task != data_manager.nb_tasks - 1:
         return
+    h036_measurements = getattr(self, "_h036_measurements", None)
+    if not h036_measurements:
+        raise RuntimeError("H038 requires the final H036 measurement before emission")
+    h036_final = h036_measurements[-1]
+    h036_partition = h036_final.get("final_error_last_positive_partition")
+    if not isinstance(h036_partition, dict):
+        raise RuntimeError("H038 final H036 measurement is missing final error partition")
+    if "layer3->layer4" not in h036_partition or "never_positive" not in h036_partition:
+        raise RuntimeError("H038 final H036 measurement is missing preregistered partitions")
+    h036_last_collapse = int(h036_partition["layer3->layer4"])
+    h036_never_positive = int(h036_partition["never_positive"])
+    official_nme = float(h036_final["official_accuracy"])
+    if not 0.0 <= official_nme <= 1.0:
+        raise ValueError("H038 final H036 official NME is outside [0, 1]")
     diagnostics = getattr(self, "_h038_diagnostics", [])
-    collapse = int(sum(item["collapse_samples"] for item in diagnostics))
-    never_positive = int(sum(item["never_positive_samples"] for item in diagnostics))
     artifact = {
         "schema": "openresearch.h038-ungated-margin-ablation.v1",
         "hypothesis": "ungated replay margin preservation tests whether negative Layer3 teacher margins should be constrained toward zero",
         "originalCommit": _H038_PARENT_COMMIT,
         "protocol": {"model": "iCaRL", "convnet": "resnet18", "memory_size": 6000, "seed": 1993, "controls": "H018 exact; H029-H036 telemetry preserved"},
         "intervention": {"teacher_layer": "layer3", "student_layer": "layer4", "prototype_source": "frozen old network rehearsal memory", "competitor": "Layer3 hard competitor, reused for Layer4", "target_margin": "clamp_min(teacher Layer3 margin, 0)", "loss": "mean relu(target_margin.detach() - student Layer4 margin)", "coefficient": _H038_MARGIN_COEFFICIENT, "target_policy": "all replay/old-class rows", "new_samples_constrained": False, "final_embedding_constrained": False},
-        "preregistration": {"target_engagement": {"collapse_max": _H038_COLLAPSE_MAX, "never_positive_max": _H038_NEVER_POSITIVE_MAX, "observed": {"collapse": collapse, "never_positive": never_positive}, "collapse_gate": bool(collapse <= _H038_COLLAPSE_MAX), "never_positive_gate": bool(never_positive <= _H038_NEVER_POSITIVE_MAX)}, "capability_support": {"metric": "aggregate official NME", "threshold": _H038_CAPABILITY_NME_THRESHOLD}, "interpretation": "engagement gates are not capability proof; evaluator NME remains authoritative"},
+        "preregistration": {"target_engagement": {"collapse_max": _H038_COLLAPSE_MAX, "never_positive_max": _H038_NEVER_POSITIVE_MAX, "observed": {"collapse": h036_last_collapse, "never_positive": h036_never_positive}, "source": "final H036 measurement final_error_last_positive_partition", "collapse_gate": bool(h036_last_collapse <= _H038_COLLAPSE_MAX), "never_positive_gate": bool(h036_never_positive <= _H038_NEVER_POSITIVE_MAX)}, "capability_support": {"metric": "aggregate official NME", "threshold": _H038_CAPABILITY_NME_THRESHOLD, "official_final_task_nme": official_nme, "aggregate_nme_available": False, "capability_threshold_met": None, "capability_evaluated_externally": True}, "interpretation": "engagement gates are not capability proof; evaluator NME remains authoritative"},
+        "h036_engagement": {"final_layer3_to_layer4_last_collapse_count": h036_last_collapse, "never_positive_count": h036_never_positive, "target_engaged": bool(h036_last_collapse <= _H038_COLLAPSE_MAX and h036_never_positive <= _H038_NEVER_POSITIVE_MAX), "official_final_task_nme": official_nme, "aggregate_nme_available": False, "capability_threshold_met": None, "capability_evaluated_externally": True},
         "diagnostics": diagnostics,
         "synthetic_cpu_check": _h038_synthetic_cpu_test(),
         "static_contract_check": _h038_static_contract_check(),
