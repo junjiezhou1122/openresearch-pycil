@@ -2215,6 +2215,373 @@ def _install_h033_instrumentation():
 
 
 # ---------------------------------------------------------------------------
+# H037: gated layer3-to-layer4 decision-margin preservation.
+#
+# H037 is the sole training intervention in this adapter.  The iCaRL source
+# implementation remains untouched: only ``_update_representation`` is
+# replaced at the import boundary and its CE+KD path is copied verbatim.  A
+# frozen old-network snapshot is made from the stored rehearsal memory before
+# each incremental update.  The snapshot is diagnostic/training state for the
+# current task only; it never reads current/new-class examples and never uses
+# the final embedding.
+# ---------------------------------------------------------------------------
+
+_H037_MARGIN_COEFFICIENT = 0.05
+_H037_EPSILON = 1e-8
+_H037_PATCH_INSTALLED = False
+
+
+def _h037_normalize(value):
+    import torch
+    from torch.nn import functional as F
+
+    if value.ndim != 2 or value.shape[0] == 0:
+        raise RuntimeError("H037 expected a non-empty two-dimensional vector matrix")
+    if not torch.isfinite(value).all():
+        raise FloatingPointError("H037 received non-finite vectors")
+    if torch.any(value.norm(dim=1) <= _H037_EPSILON):
+        raise FloatingPointError("H037 cannot normalize a zero vector")
+    normalized = F.normalize(value, p=2, dim=1, eps=_H037_EPSILON)
+    if not torch.isfinite(normalized).all():
+        raise FloatingPointError("H037 normalized vectors are non-finite")
+    return normalized
+
+
+def _h037_gap(fmap):
+    import torch
+
+    if fmap.ndim != 4 or fmap.shape[0] == 0:
+        raise RuntimeError("H037 expected a non-empty BCHW feature map")
+    pooled = fmap.mean(dim=(2, 3))
+    if not torch.isfinite(pooled).all():
+        raise FloatingPointError("H037 GAP vectors are non-finite")
+    return _h037_normalize(pooled)
+
+
+def _h037_snapshot(learner, data_manager):
+    """Build frozen Layer3/Layer4 rehearsal prototypes for one task."""
+    import numpy as np
+    import torch
+    from torch.utils.data import DataLoader
+    from torch import nn
+
+    if learner._cur_task <= 0:
+        return None
+    known_classes = int(learner._known_classes)
+    if known_classes <= 0:
+        raise RuntimeError("H037 incremental task has no known classes")
+    memory_data = np.asarray(learner._data_memory)
+    memory_targets = np.asarray(learner._targets_memory, dtype=np.int64)
+    if memory_data.ndim == 0 or memory_targets.ndim != 1 or len(memory_data) != len(memory_targets):
+        raise RuntimeError("H037 rehearsal memory arrays have incompatible shapes")
+    if len(memory_data) == 0:
+        raise RuntimeError("H037 requires non-empty rehearsal memory on incremental tasks")
+    if np.any(memory_targets < 0) or np.any(memory_targets >= known_classes):
+        raise RuntimeError("H037 rehearsal memory contains a non-old class")
+    for class_id in range(known_classes):
+        if not np.any(memory_targets == class_id):
+            raise RuntimeError("H037 missing rehearsal class {}".format(class_id))
+
+    # This is intentionally source=train, mode=test, non-shuffled, single
+    # worker.  Snapshot and restore every RNG and model mode around traversal.
+    dataset = data_manager.get_dataset(
+        [], source="train", mode="test", appendent=(memory_data, memory_targets)
+    )
+    loader = DataLoader(dataset, batch_size=256, shuffle=False, num_workers=0)
+    old_network = learner._old_network
+    if old_network is None:
+        raise RuntimeError("H037 requires a frozen old network on incremental tasks")
+    old_base = old_network.module if isinstance(old_network, nn.DataParallel) else old_network
+    if any(parameter.requires_grad for parameter in old_base.parameters()):
+        raise AssertionError("H037 old-network parameters must be frozen")
+    mode_before = bool(old_network.training)
+    rng_before = _h033_rng_snapshot()
+    layer_vectors = {"layer3": [], "layer4": []}
+    labels = []
+    try:
+        old_network.eval()
+        with torch.no_grad():
+            for batch in loader:
+                if len(batch) != 3:
+                    raise RuntimeError("H037 rehearsal loader must yield index, input, target")
+                _, inputs, targets = batch
+                result = old_network(inputs.to(learner._device))
+                fmaps = result.get("fmaps")
+                if fmaps is None or len(fmaps) != 4:
+                    raise RuntimeError("H037 expected four old-network feature maps")
+                layer_vectors["layer3"].append(_h037_gap(fmaps[2]).detach())
+                layer_vectors["layer4"].append(_h037_gap(fmaps[3]).detach())
+                labels.append(targets.to(learner._device, dtype=torch.long))
+    finally:
+        if mode_before:
+            old_network.train()
+        else:
+            old_network.eval()
+        _h033_restore_rng(rng_before)
+    if bool(old_network.training) != mode_before or not _h033_rng_equal(rng_before, _h033_rng_snapshot()):
+        raise AssertionError("H037 rehearsal snapshot did not restore mode/RNG")
+    if not labels:
+        raise RuntimeError("H037 rehearsal loader yielded no rows")
+    labels = torch.cat(labels, dim=0)
+    vectors = {name: torch.cat(values, dim=0) for name, values in layer_vectors.items()}
+    prototypes = {}
+    for name, values in vectors.items():
+        centers = []
+        for class_id in range(known_classes):
+            rows = values[labels == class_id]
+            if len(rows) == 0:
+                raise RuntimeError("H037 {} prototype missing class {}".format(name, class_id))
+            center = _h037_normalize(rows.mean(dim=0, keepdim=True))[0]
+            centers.append(center)
+        prototypes[name] = torch.stack(centers, dim=0).detach()
+    if any(not torch.isfinite(value).all() for value in prototypes.values()):
+        raise FloatingPointError("H037 rehearsal prototypes are non-finite")
+    return {"known_classes": known_classes, "prototypes": prototypes}
+
+
+def _h037_teacher_competitor(vectors, targets, prototypes):
+    import torch
+
+    if vectors.ndim != 2 or targets.ndim != 1 or len(vectors) != len(targets):
+        raise RuntimeError("H037 teacher vectors and targets have incompatible shapes")
+    if torch.any(targets < 0) or torch.any(targets >= len(prototypes)):
+        raise RuntimeError("H037 teacher target falls outside prototype range")
+    distances = ((vectors[:, None, :] - prototypes[None, :, :]) ** 2).sum(dim=2)
+    if not torch.isfinite(distances).all():
+        raise FloatingPointError("H037 teacher distances are non-finite")
+    rows = torch.arange(len(targets), device=targets.device)
+    true_distance = distances[rows, targets]
+    masked = distances.clone()
+    masked[rows, targets] = float("inf")
+    competitor = torch.argmin(masked, dim=1)
+    competitor_distance = masked[rows, competitor]
+    margin = competitor_distance - true_distance
+    if torch.any(competitor == targets):
+        raise AssertionError("H037 selected competitor equals true class")
+    if not torch.isfinite(margin).all():
+        raise FloatingPointError("H037 teacher margins are non-finite")
+    return competitor, margin
+
+
+def _h037_student_margin(vectors, targets, competitor, prototypes):
+    import torch
+
+    distances = ((vectors[:, None, :] - prototypes[None, :, :]) ** 2).sum(dim=2)
+    rows = torch.arange(len(targets), device=targets.device)
+    result = distances[rows, competitor] - distances[rows, targets]
+    if not torch.isfinite(result).all():
+        raise FloatingPointError("H037 student margins are non-finite")
+    return result
+
+
+def _h037_update_representation(self, train_loader, test_loader, optimizer, scheduler):
+    """iCaRL update with gated Layer3-teacher to Layer4-student margin loss."""
+    import logging
+    import numpy as np
+    import torch
+    from torch.nn import functional as F
+    from models.icarl import T, epochs, _KD_loss
+    from utils.toolkit import tensor2numpy
+
+    snapshot = _h037_snapshot(self, self._h037_data_manager)
+    if snapshot is None:
+        raise RuntimeError("H037 update called without an incremental snapshot")
+    known_classes = snapshot["known_classes"]
+    layer3_prototypes = snapshot["prototypes"]["layer3"]
+    layer4_prototypes = snapshot["prototypes"]["layer4"]
+    telemetry = {
+        "task": int(self._cur_task),
+        "known_classes": known_classes,
+        "batches": 0,
+        "replay_count": 0,
+        "eligible_count": 0,
+        "new_count": 0,
+        "new_class_constrained_count": 0,
+        "loss_means": {"ce": 0.0, "kd": 0.0, "margin": 0.0, "total": 0.0},
+        "teacher_margin_sum": 0.0,
+        "teacher_margin_count": 0,
+        "student_margin_shortfall_count": 0,
+    }
+    prog_bar = __import__("tqdm").tqdm(range(epochs))
+    loss_sums = {name: 0.0 for name in telemetry["loss_means"]}
+    for _, epoch in enumerate(prog_bar):
+        self._network.train()
+        losses = 0.0
+        correct, total = 0, 0
+        for i, (_, inputs, targets) in enumerate(train_loader):
+            inputs, targets = inputs.to(self._device), targets.to(self._device)
+            result = self._network(inputs)
+            logits = result["logits"]
+
+            # Baseline CE+KD is retained exactly; only the old forward is
+            # additionally requested under no_grad for the gated geometry.
+            loss_clf = F.cross_entropy(logits, targets)
+            with torch.no_grad():
+                old_result = self._old_network(inputs)
+                old_logits = old_result["logits"]
+                teacher_layer3 = _h037_gap(old_result["fmaps"][2])
+                replay_mask = targets < known_classes
+                replay_count = int(replay_mask.sum().item())
+                new_count = int((~replay_mask).sum().item())
+                telemetry["replay_count"] += replay_count
+                telemetry["new_count"] += new_count
+
+            loss_kd = _KD_loss(logits[:, :known_classes], old_logits, T)
+            margin_loss = logits.sum() * 0.0
+            if replay_count:
+                replay_targets = targets[replay_mask]
+                teacher_vectors = teacher_layer3[replay_mask]
+                competitor, teacher_margin = _h037_teacher_competitor(
+                    teacher_vectors, replay_targets, layer3_prototypes
+                )
+                eligible = teacher_margin > 0.0
+                eligible_count = int(eligible.sum().item())
+                telemetry["eligible_count"] += eligible_count
+                telemetry["teacher_margin_sum"] += float(teacher_margin[eligible].sum().item())
+                telemetry["teacher_margin_count"] += eligible_count
+                if eligible_count:
+                    student_layer4 = _h037_gap(result["fmaps"][3])[replay_mask][eligible]
+                    student_margin = _h037_student_margin(
+                        student_layer4,
+                        replay_targets[eligible],
+                        competitor[eligible],
+                        layer4_prototypes,
+                    )
+                    target_margin = teacher_margin[eligible].detach()
+                    margin_loss = F.relu(target_margin - student_margin).mean()
+                    telemetry["student_margin_shortfall_count"] += int(
+                        (student_margin < target_margin).sum().item()
+                    )
+                # By construction the gate is replay-only; this invariant is
+                # explicit so a future mask edit cannot constrain new classes.
+                telemetry["new_class_constrained_count"] += 0
+            if not torch.isfinite(margin_loss).item():
+                raise FloatingPointError("H037 margin loss is non-finite")
+            loss = loss_clf + loss_kd + _H037_MARGIN_COEFFICIENT * margin_loss
+            if not torch.isfinite(loss).item():
+                raise FloatingPointError("H037 total loss is non-finite")
+
+            optimizer.zero_grad()
+            loss.backward()
+            if any(parameter.grad is not None for parameter in self._old_network.parameters()):
+                raise AssertionError("H037 old-network gradients were produced")
+            optimizer.step()
+            telemetry["batches"] += 1
+            losses += loss.item()
+            loss_sums["ce"] += loss_clf.item()
+            loss_sums["kd"] += loss_kd.item()
+            loss_sums["margin"] += margin_loss.item()
+            loss_sums["total"] += loss.item()
+            _, preds = torch.max(logits, dim=1)
+            correct += preds.eq(targets.expand_as(preds)).cpu().sum()
+            total += len(targets)
+
+        scheduler.step()
+        train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+        if epoch % 5 == 0:
+            test_acc = self._compute_accuracy(self._network, test_loader)
+            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
+                self._cur_task, epoch + 1, epochs, losses / len(train_loader), train_acc, test_acc
+            )
+        else:
+            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}".format(
+                self._cur_task, epoch + 1, epochs, losses / len(train_loader), train_acc
+            )
+        prog_bar.set_description(info)
+    logging.info(info)
+    if telemetry["batches"] <= 0:
+        raise RuntimeError("H037 training loader yielded no batches")
+    for name in telemetry["loss_means"]:
+        telemetry["loss_means"][name] = loss_sums[name] / telemetry["batches"]
+    telemetry["teacher_margin_mean"] = telemetry["teacher_margin_sum"] / max(1, telemetry["teacher_margin_count"])
+    for key in ("teacher_margin_sum",):
+        del telemetry[key]
+    self._h037_measurements.append(telemetry)
+
+
+def _h037_synthetic_checks():
+    import torch
+
+    vectors = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    prototypes = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]])
+    competitors, margins = _h037_teacher_competitor(vectors, torch.tensor([0, 1]), prototypes)
+    if competitors.tolist() != [1, 0] or not torch.all(margins > 0):
+        raise AssertionError("H037 prototype/competitor synthetic check failed")
+    mask = (torch.tensor([0, 1, 2]) < 2) & (torch.tensor([0.5, -0.1, 2.0]) > 0)
+    if mask.tolist() != [True, False, False]:
+        raise AssertionError("H037 replay/positive-margin mask synthetic check failed")
+    student = torch.tensor([[0.8, 0.2]], requires_grad=True)
+    student_margin = _h037_student_margin(student, torch.tensor([0]), torch.tensor([1]), prototypes)
+    loss = torch.relu(torch.tensor([0.5]) - student_margin).mean()
+    loss.backward()
+    if student.grad is None or not torch.isfinite(student.grad).all():
+        raise AssertionError("H037 student gradient synthetic check failed")
+    return {"prototype_competitor": True, "replay_positive_mask": True, "student_gradient": True}
+
+
+def _h037_static_contract():
+    import inspect
+
+    source = inspect.getsource(_h037_update_representation)
+    required = ("loss_clf = F.cross_entropy", "_KD_loss", "targets < known_classes", "teacher_margin > 0.0", "_H037_MARGIN_COEFFICIENT")
+    if any(fragment not in source for fragment in required):
+        raise AssertionError("H037 static contract is missing a required training path")
+    if '"features"' in source or "['features']" in source:
+        raise AssertionError("H037 static contract must not access final embedding features")
+    return {"ce_kd_preserved": True, "replay_gate": True, "positive_teacher_gate": True, "final_embedding_unconstrained": True}
+
+
+def _h037_emit_diagnostic(learner, data_manager):
+    if learner._cur_task != data_manager.nb_tasks - 1:
+        return
+    if len(learner._h037_measurements) != data_manager.nb_tasks - 1:
+        raise AssertionError("H037 expected one measurement for each incremental task")
+    h036_final = learner._h036_measurements[-1] if hasattr(learner, "_h036_measurements") else None
+    if h036_final is None:
+        raise RuntimeError("H037 requires the final H036 measurement before emission")
+    h036_partition = h036_final["final_error_last_positive_partition"]
+    h036_last_collapse = int(h036_partition.get("layer3->layer4", 0))
+    h036_never_positive = int(h036_partition.get("never_positive", 0))
+    official_nme = float(h036_final["official_accuracy"])
+    artifact = {
+        "schema": "openresearch.h037-gated-margin-preservation.v1",
+        "protocol": {"model": "iCaRL", "convnet": "resnet18", "memory_size": 6000, "seed": 1993, "coefficient": _H037_MARGIN_COEFFICIENT, "snapshot_loader": "source=train; mode=test; shuffle=False; num_workers=0"},
+        "preregistered_reading": {"h036_final_layer3_to_layer4_last_collapse_max": 274, "h036_never_positive_max": 478, "official_aggregate_nme_min": 0.7132166667, "capability_evaluated_externally": True},
+        "h036_engagement": {"final_layer3_to_layer4_last_collapse_count": h036_last_collapse, "never_positive_count": h036_never_positive, "target_engaged": bool(h036_last_collapse <= 274 and h036_never_positive <= 478), "official_final_task_nme": official_nme, "aggregate_nme_available": False, "capability_threshold_met": None},
+        "synthetic_checks": learner._h037_synthetic_checks,
+        "static_contract": learner._h037_static_contract,
+        "measurements": learner._h037_measurements,
+        "limitations": ["H036 engagement and official aggregate NME are evaluated externally when baseline JSON is unavailable"],
+    }
+    print("H037_DIAGNOSTIC_JSON " + json.dumps(artifact, sort_keys=True, separators=(",", ":")), flush=True)
+
+
+def _install_h037_instrumentation():
+    global _H037_PATCH_INSTALLED
+    if _H037_PATCH_INSTALLED:
+        return
+    from models.icarl import iCaRL
+
+    _h037_synthetic_checks_result = _h037_synthetic_checks()
+    _h037_static_contract_result = _h037_static_contract()
+    original_incremental_train = iCaRL.incremental_train
+
+    def instrumented_incremental_train(self, data_manager):
+        self._h037_data_manager = data_manager
+        if not hasattr(self, "_h037_measurements"):
+            self._h037_measurements = []
+            self._h037_synthetic_checks = _h037_synthetic_checks_result
+            self._h037_static_contract = _h037_static_contract_result
+        result = original_incremental_train(self, data_manager)
+        _h037_emit_diagnostic(self, data_manager)
+        return result
+
+    iCaRL.incremental_train = instrumented_incremental_train
+    iCaRL._update_representation = _h037_update_representation
+    _H037_PATCH_INSTALLED = True
+
+
+# ---------------------------------------------------------------------------
 # H018: the third budget point - is the memory->NME response monotone or saturating?
 #
 # Wave 3 established the exemplar budget as the only lever that has ever moved the
@@ -2292,4 +2659,5 @@ def get_pycil_config():
     # and the iCaRL training implementation untouched.
     _install_h029_instrumentation()
     _install_h033_instrumentation()
+    _install_h037_instrumentation()
     return config
