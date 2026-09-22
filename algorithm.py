@@ -2215,6 +2215,363 @@ def _install_h033_instrumentation():
 
 
 # ---------------------------------------------------------------------------
+# H038: ungated Layer3-teacher -> Layer4-student margin ablation.
+#
+# H037's decision-margin intervention is intentionally reproduced here with
+# one changed target policy: every replay/old-class row is included, including
+# rows whose frozen Layer3 teacher margin is negative.  Prototypes are made
+# once, deterministically, from the frozen old network and rehearsal memory;
+# the current network is only used for the Layer4 student margin.  This is a
+# training intervention, so the normal CE+KD objective, optimizer, scheduler,
+# replay selection, and BaseLearner lifecycle remain untouched.
+# ---------------------------------------------------------------------------
+
+_H038_PARENT_COMMIT = "13d1d74a145c9a09d669da10209ed867a29c1945"
+_H038_MARGIN_COEFFICIENT = 0.05
+_H038_COLLAPSE_MAX = 274
+_H038_NEVER_POSITIVE_MAX = 478
+_H038_CAPABILITY_NME_THRESHOLD = 0.7132166667
+_H038_PATCH_INSTALLED = False
+_H038_CONTRACT_CHECKED = False
+
+
+def _h038_old_class_mask(targets, known_classes):
+    import torch
+
+    if not torch.is_tensor(targets) or targets.ndim != 1:
+        raise ValueError("H038 targets must be a rank-1 torch.Tensor")
+    if not isinstance(known_classes, int) or known_classes <= 0:
+        raise ValueError("H038 known_classes must be a positive integer")
+    return targets < known_classes
+
+
+def _h038_pool_normalize(value):
+    """Match H036 global-average pooling and NumPy/EPSILON normalization."""
+    import torch
+
+    if not torch.is_tensor(value) or value.ndim not in (2, 4):
+        raise ValueError("H038 layer values must be rank-2 or rank-4 tensors")
+    if value.ndim == 4:
+        value = value.mean(dim=(2, 3))
+    if value.ndim != 2 or value.shape[0] == 0:
+        raise ValueError("H038 layer values cannot be empty")
+    if not bool(torch.isfinite(value).all()):
+        raise FloatingPointError("H038 layer values are non-finite")
+    normalized = value / (torch.linalg.vector_norm(value, dim=1, keepdim=True) + 1e-8)
+    if not bool(torch.isfinite(normalized).all()):
+        raise FloatingPointError("H038 normalized layer values are non-finite")
+    return normalized
+
+
+def _h038_prototypes(vectors, labels, total_classes):
+    """Build normalized class centers from deterministic rehearsal vectors."""
+    import torch
+
+    if not torch.is_tensor(vectors) or vectors.ndim != 2 or vectors.shape[0] == 0:
+        raise ValueError("H038 prototype vectors must be a non-empty rank-2 tensor")
+    if not torch.is_tensor(labels) or labels.ndim != 1 or len(labels) != len(vectors):
+        raise ValueError("H038 prototype labels do not match vectors")
+    if not isinstance(total_classes, int) or total_classes <= 0:
+        raise ValueError("H038 total_classes must be positive")
+    if not bool(torch.isfinite(vectors).all()):
+        raise FloatingPointError("H038 prototype vectors are non-finite")
+    if bool((labels < 0).any()) or bool((labels >= total_classes).any()):
+        raise ValueError("H038 rehearsal labels fall outside seen classes")
+    centers = []
+    for class_id in range(total_classes):
+        rows = vectors[labels == class_id]
+        if rows.shape[0] == 0:
+            raise RuntimeError("H038 missing rehearsal class {}".format(class_id))
+        centers.append(_h038_pool_normalize(rows.mean(dim=0, keepdim=True))[0])
+    result = torch.stack(centers, dim=0)
+    if not bool(torch.isfinite(result).all()):
+        raise FloatingPointError("H038 prototypes are non-finite")
+    return result
+
+
+def _h038_margin_triplet(teacher_layer3, student_layer4, labels, layer3_prototypes, layer4_prototypes):
+    """Return teacher margin, hard competitor, and current student margin."""
+    import torch
+
+    tensors = (teacher_layer3, student_layer4, labels, layer3_prototypes, layer4_prototypes)
+    if not all(torch.is_tensor(value) for value in tensors):
+        raise TypeError("H038 margin inputs must be tensors")
+    if teacher_layer3.ndim != 2 or student_layer4.ndim != 2 or labels.ndim != 1:
+        raise ValueError("H038 margin inputs have invalid ranks")
+    if len(teacher_layer3) == 0 or len(student_layer4) != len(teacher_layer3):
+        raise ValueError("H038 margin inputs are empty or misaligned")
+    if layer3_prototypes.ndim != 2 or layer4_prototypes.ndim != 2:
+        raise ValueError("H038 prototypes must be rank-2 tensors")
+    if labels.numel() != len(teacher_layer3) or bool((labels < 0).any()):
+        raise ValueError("H038 margin labels are invalid")
+    if bool((labels >= layer3_prototypes.shape[0]).any()) or layer3_prototypes.shape[0] != layer4_prototypes.shape[0]:
+        raise ValueError("H038 margin prototype shapes are incompatible")
+    if teacher_layer3.shape[1] != layer3_prototypes.shape[1] or student_layer4.shape[1] != layer4_prototypes.shape[1]:
+        raise ValueError("H038 margin feature dimensions are incompatible")
+    if not all(bool(torch.isfinite(value).all()) for value in tensors):
+        raise FloatingPointError("H038 margin inputs are non-finite")
+
+    # Squared Euclidean distances match H036/H033 NME geometry.  The teacher
+    # decides the competitor once; the student is never allowed to reselect it.
+    teacher_distances = torch.cdist(teacher_layer3.detach(), layer3_prototypes.detach(), p=2).pow(2)
+    rows = torch.arange(len(labels), device=labels.device)
+    true_teacher = teacher_distances[rows, labels]
+    masked = teacher_distances.clone()
+    masked[rows, labels] = float("inf")
+    competitors = torch.argmin(masked, dim=1)
+    teacher_margin = masked[rows, competitors] - true_teacher
+    student_distances = torch.cdist(student_layer4, layer4_prototypes.detach(), p=2).pow(2)
+    student_margin = student_distances[rows, competitors] - student_distances[rows, labels]
+    if not bool(torch.isfinite(teacher_margin).all()) or not bool(torch.isfinite(student_margin).all()):
+        raise FloatingPointError("H038 margins are non-finite")
+    return teacher_margin.detach(), competitors.detach(), student_margin
+
+
+def _h038_margin_loss(targets, teacher_margin, student_margin, known_classes):
+    """Ungated replay margin loss; new-class rows are strictly excluded."""
+    import torch
+
+    if not (torch.is_tensor(targets) and torch.is_tensor(teacher_margin) and torch.is_tensor(student_margin)):
+        raise TypeError("H038 loss inputs must be tensors")
+    if targets.ndim != 1 or teacher_margin.shape != targets.shape or student_margin.shape != targets.shape:
+        raise ValueError("H038 loss inputs are misaligned")
+    old_mask = _h038_old_class_mask(targets, known_classes)
+    if not bool(torch.isfinite(teacher_margin).all()) or not bool(torch.isfinite(student_margin).all()):
+        raise FloatingPointError("H038 loss margins are non-finite")
+    if not bool(old_mask.any()):
+        return student_margin.new_zeros(())
+    target_margin = torch.clamp_min(teacher_margin[old_mask].detach(), 0.0)
+    loss_margin = torch.relu(target_margin - student_margin[old_mask]).mean()
+    if not bool(torch.isfinite(loss_margin)):
+        raise FloatingPointError("H038 margin loss is non-finite")
+    return loss_margin
+
+
+def _h038_synthetic_cpu_test():
+    """Prove negative-teacher replay rows are active and new rows are not."""
+    import torch
+
+    targets = torch.tensor([0, 1, 2], dtype=torch.long)
+    teacher = torch.tensor([-1.0, 1.0, -3.0])
+    student = torch.tensor([-0.5, -0.5, -0.5], requires_grad=True)
+    loss = _h038_margin_loss(targets, teacher, student, 2)
+    if abs(float(loss.item()) - 1.0) > 1e-7:
+        raise AssertionError("H038 negative-teacher replay row was not clamped to zero")
+    loss.backward()
+    if not torch.equal(student.grad, torch.tensor([-0.5, -0.5, 0.0])):
+        raise AssertionError("H038 new-class row received a margin gradient")
+    return {
+        "negative_teacher_target": 0.0,
+        "replay_rows_constrained": 2,
+        "new_rows_constrained": 0,
+        "gradient_boundary": True,
+    }
+
+
+def _h038_static_contract_check():
+    """Fail fast if the update hook accesses Layer1/2 or final embeddings."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(_h038_update_representation))
+    fmap_indices = {"outputs_fmaps": set(), "old_outputs_fmaps": set()}
+    final_accesses = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Subscript):
+            index = node.slice.value if isinstance(node.slice, ast.Index) else node.slice
+            if isinstance(node.value, ast.Name) and node.value.id in fmap_indices:
+                if not isinstance(index, ast.Constant) or not isinstance(index.value, int):
+                    raise AssertionError("H038 feature-map index must be static")
+                fmap_indices[node.value.id].add(index.value)
+            if isinstance(index, ast.Constant) and index.value == "features":
+                final_accesses.append(node)
+    if final_accesses or fmap_indices["outputs_fmaps"] != {3} or fmap_indices["old_outputs_fmaps"] != {2}:
+        raise AssertionError("H038 must use current Layer4 and frozen Layer3 only")
+    return {"current_feature_map_indices": [3], "teacher_feature_map_indices": [2], "final_embedding_accesses": 0}
+
+
+def _h038_rehearsal_geometry(self):
+    """Extract frozen-old Layer3/Layer4 prototypes from deterministic memory."""
+    import torch
+    from torch.utils.data import DataLoader
+    from torch import nn
+
+    data_manager = getattr(self, "_h038_data_manager", None)
+    if data_manager is None:
+        raise RuntimeError("H038 requires the data manager for deterministic rehearsal construction")
+    memory_data = getattr(self, "_data_memory", None)
+    memory_targets = getattr(self, "_targets_memory", None)
+    if memory_data is None or memory_targets is None or len(memory_data) == 0:
+        raise RuntimeError("H038 incremental task has empty replay memory")
+    memory_targets = torch.as_tensor(memory_targets, dtype=torch.long)
+    if len(memory_data) != len(memory_targets) or not bool((memory_targets < self._known_classes).all()):
+        raise RuntimeError("H038 replay memory is incompatible with known classes")
+    dataset = data_manager.get_dataset([], source="train", mode="test", appendent=(memory_data, memory_targets.numpy()))
+    loader = DataLoader(dataset, batch_size=256, shuffle=False, num_workers=0)
+    old_network = self._old_network.module if isinstance(self._old_network, nn.DataParallel) else self._old_network
+    if old_network is None or any(parameter.requires_grad for parameter in old_network.parameters()):
+        raise RuntimeError("H038 old network must exist and remain frozen")
+    state_before = {name: value.detach().cpu().clone() for name, value in old_network.state_dict().items()}
+    was_training = old_network.training
+    old_network.eval()
+    vectors3, vectors4, labels = [], [], []
+    try:
+        with torch.no_grad():
+            for _, inputs, targets in loader:
+                result = old_network(inputs.to(self._device))
+                old_fmaps = result.get("fmaps")
+                if old_fmaps is None or len(old_fmaps) != 4:
+                    raise RuntimeError("H038 expected four frozen-network feature maps")
+                vectors3.append(_h038_pool_normalize(old_fmaps[2]).cpu())
+                vectors4.append(_h038_pool_normalize(old_fmaps[3]).cpu())
+                labels.append(targets.to(dtype=torch.long).cpu())
+    finally:
+        old_network.train(was_training)
+    for name, value in old_network.state_dict().items():
+        if not torch.equal(value.detach().cpu(), state_before[name]):
+            raise AssertionError("H038 frozen old network mutated during prototype construction")
+    if not labels:
+        raise RuntimeError("H038 deterministic rehearsal loader yielded no rows")
+    vectors3, vectors4, labels = torch.cat(vectors3), torch.cat(vectors4), torch.cat(labels)
+    if not torch.equal(labels, memory_targets):
+        raise AssertionError("H038 deterministic rehearsal order changed")
+    return {
+        "layer3": _h038_prototypes(vectors3, labels, self._known_classes).to(self._device),
+        "layer4": _h038_prototypes(vectors4, labels, self._known_classes).to(self._device),
+        "memory_count": int(len(labels)),
+    }
+
+
+def _h038_update_representation(self, train_loader, test_loader, optimizer, scheduler):
+    """H018 CE+KD plus ungated old-class Layer3->Layer4 margin preservation."""
+    import logging
+    import numpy as np
+    import torch
+    from torch.nn import functional as F
+    from tqdm import tqdm
+    from models import icarl as icarl_module
+    from utils.toolkit import tensor2numpy
+
+    if self._cur_task == 0 or self._old_network is None:
+        raise RuntimeError("H038 margin hook requires an incremental frozen old network")
+    if any(parameter.requires_grad for parameter in self._old_network.parameters()):
+        raise RuntimeError("H038 old network must be frozen before distillation")
+    geometry = _h038_rehearsal_geometry(self)
+    diagnostics = {"task": int(self._cur_task), "known_classes": int(self._known_classes), "total_classes": int(self._total_classes), "epochs": int(icarl_module.epochs), "batches": 0, "samples": 0, "old_class_samples": 0, "new_class_samples": 0, "constrained_samples": 0, "negative_teacher_margin_samples": 0, "collapse_samples": 0, "never_positive_samples": 0, "loss_sum": {"base": 0.0, "kd": 0.0, "margin": 0.0, "total": 0.0}}
+    prog_bar = tqdm(range(icarl_module.epochs))
+    for _, epoch in enumerate(prog_bar):
+        self._network.train()
+        losses = 0.0
+        correct, total = 0, 0
+        for _, (_, inputs, targets) in enumerate(train_loader):
+            inputs, targets = inputs.to(self._device), targets.to(self._device)
+            outputs = self._network(inputs)
+            logits = outputs["logits"]
+            loss_base = F.cross_entropy(logits, targets)
+            with torch.no_grad():
+                old_outputs = self._old_network(inputs)
+            loss_kd = icarl_module._KD_loss(logits[:, : self._known_classes], old_outputs["logits"], icarl_module.T)
+            old_mask = _h038_old_class_mask(targets, self._known_classes)
+            old_count = int(old_mask.sum().item())
+            new_count = int((~old_mask).sum().item())
+            loss_margin = logits.new_zeros(())
+            if old_count:
+                outputs_fmaps = outputs.get("fmaps")
+                old_outputs_fmaps = old_outputs.get("fmaps")
+                if outputs_fmaps is None or len(outputs_fmaps) != 4 or old_outputs_fmaps is None or len(old_outputs_fmaps) != 4:
+                    raise RuntimeError("H038 expected four current and frozen feature maps")
+                teacher_layer3 = _h038_pool_normalize(old_outputs_fmaps[2][old_mask])
+                student_layer4 = _h038_pool_normalize(outputs_fmaps[3][old_mask])
+                teacher_margin, _, student_margin = _h038_margin_triplet(teacher_layer3, student_layer4, targets[old_mask], geometry["layer3"], geometry["layer4"])
+                loss_margin = _h038_margin_loss(targets[old_mask], teacher_margin, student_margin, self._known_classes)
+                diagnostics["negative_teacher_margin_samples"] += int((teacher_margin < 0).sum().item())
+                diagnostics["collapse_samples"] += int(((teacher_margin > 0) & (student_margin <= 0)).sum().item())
+                diagnostics["never_positive_samples"] += int((teacher_margin <= 0).sum().item())
+            loss = loss_base + loss_kd + _H038_MARGIN_COEFFICIENT * loss_margin
+            if not bool(torch.isfinite(loss)):
+                raise FloatingPointError("H038 total loss is non-finite")
+            optimizer.zero_grad()
+            loss.backward()
+            if any(parameter.grad is not None for parameter in self._old_network.parameters()):
+                raise AssertionError("H038 old network received a gradient")
+            optimizer.step()
+            losses += loss.item()
+            diagnostics["batches"] += 1
+            diagnostics["samples"] += int(targets.shape[0])
+            diagnostics["old_class_samples"] += old_count
+            diagnostics["new_class_samples"] += new_count
+            diagnostics["constrained_samples"] += old_count
+            for key, value in (("base", loss_base), ("kd", loss_kd), ("margin", loss_margin), ("total", loss)):
+                diagnostics["loss_sum"][key] += float(value.detach().item())
+            _, preds = torch.max(logits, dim=1)
+            correct += preds.eq(targets.expand_as(preds)).cpu().sum()
+            total += len(targets)
+        scheduler.step()
+        if total == 0:
+            raise RuntimeError("H038 update encountered an empty train loader")
+        train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+        mean_margin = diagnostics["loss_sum"]["margin"] / diagnostics["batches"]
+        if epoch % 5 == 0:
+            test_acc = self._compute_accuracy(self._network, test_loader)
+            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}, H038_margin {:.4f}".format(self._cur_task, epoch + 1, icarl_module.epochs, losses / len(train_loader), train_acc, test_acc, mean_margin)
+        else:
+            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, H038_margin {:.4f}".format(self._cur_task, epoch + 1, icarl_module.epochs, losses / len(train_loader), train_acc, mean_margin)
+        prog_bar.set_description(info)
+    logging.info(info)
+    if diagnostics["batches"] == 0 or diagnostics["old_class_samples"] == 0:
+        raise RuntimeError("H038 update observed an empty replay path")
+    diagnostics["loss_mean"] = {key: value / diagnostics["batches"] for key, value in diagnostics.pop("loss_sum").items()}
+    if not hasattr(self, "_h038_diagnostics"):
+        self._h038_diagnostics = []
+    self._h038_diagnostics.append(diagnostics)
+
+
+def _h038_emit_diagnostic(self, data_manager):
+    if self._cur_task != data_manager.nb_tasks - 1:
+        return
+    diagnostics = getattr(self, "_h038_diagnostics", [])
+    collapse = int(sum(item["collapse_samples"] for item in diagnostics))
+    never_positive = int(sum(item["never_positive_samples"] for item in diagnostics))
+    artifact = {
+        "schema": "openresearch.h038-ungated-margin-ablation.v1",
+        "hypothesis": "ungated replay margin preservation tests whether negative Layer3 teacher margins should be constrained toward zero",
+        "originalCommit": _H038_PARENT_COMMIT,
+        "protocol": {"model": "iCaRL", "convnet": "resnet18", "memory_size": 6000, "seed": 1993, "controls": "H018 exact; H029-H036 telemetry preserved"},
+        "intervention": {"teacher_layer": "layer3", "student_layer": "layer4", "prototype_source": "frozen old network rehearsal memory", "competitor": "Layer3 hard competitor, reused for Layer4", "target_margin": "clamp_min(teacher Layer3 margin, 0)", "loss": "mean relu(target_margin.detach() - student Layer4 margin)", "coefficient": _H038_MARGIN_COEFFICIENT, "target_policy": "all replay/old-class rows", "new_samples_constrained": False, "final_embedding_constrained": False},
+        "preregistration": {"target_engagement": {"collapse_max": _H038_COLLAPSE_MAX, "never_positive_max": _H038_NEVER_POSITIVE_MAX, "observed": {"collapse": collapse, "never_positive": never_positive}, "collapse_gate": bool(collapse <= _H038_COLLAPSE_MAX), "never_positive_gate": bool(never_positive <= _H038_NEVER_POSITIVE_MAX)}, "capability_support": {"metric": "aggregate official NME", "threshold": _H038_CAPABILITY_NME_THRESHOLD}, "interpretation": "engagement gates are not capability proof; evaluator NME remains authoritative"},
+        "diagnostics": diagnostics,
+        "synthetic_cpu_check": _h038_synthetic_cpu_test(),
+        "static_contract_check": _h038_static_contract_check(),
+        "limitations": ["no GPU/holdout result is claimed by this artifact", "margin counts are training-row engagement summaries", "negative teacher targets are zero but still active whenever student margin is negative"],
+    }
+    print("H038_DIAGNOSTIC_JSON " + json.dumps(artifact, sort_keys=True, separators=(",", ":")), flush=True)
+
+
+def _install_h038_margin_ablation():
+    global _H038_PATCH_INSTALLED, _H038_CONTRACT_CHECKED
+    if _H038_PATCH_INSTALLED:
+        return
+    if not _H038_CONTRACT_CHECKED:
+        _h038_static_contract_check()
+        _h038_synthetic_cpu_test()
+        _H038_CONTRACT_CHECKED = True
+    from models import icarl as icarl_module
+
+    original_incremental_train = icarl_module.iCaRL.incremental_train
+
+    def instrumented_incremental_train(self, data_manager):
+        self._h038_data_manager = data_manager
+        try:
+            return original_incremental_train(self, data_manager)
+        finally:
+            _h038_emit_diagnostic(self, data_manager)
+
+    icarl_module.iCaRL.incremental_train = instrumented_incremental_train
+    icarl_module.iCaRL._update_representation = _h038_update_representation
+    _H038_PATCH_INSTALLED = True
+
+
+# ---------------------------------------------------------------------------
 # H018: the third budget point - is the memory->NME response monotone or saturating?
 #
 # Wave 3 established the exemplar budget as the only lever that has ever moved the
@@ -2292,4 +2649,5 @@ def get_pycil_config():
     # and the iCaRL training implementation untouched.
     _install_h029_instrumentation()
     _install_h033_instrumentation()
+    _install_h038_margin_ablation()
     return config
