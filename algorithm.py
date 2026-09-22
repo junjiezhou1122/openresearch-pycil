@@ -2283,11 +2283,8 @@ def _h037_snapshot(learner, data_manager):
             raise RuntimeError("H037 missing rehearsal class {}".format(class_id))
 
     # This is intentionally source=train, mode=test, non-shuffled, single
-    # worker.  Snapshot and restore every RNG and model mode around traversal.
-    dataset = data_manager.get_dataset(
-        [], source="train", mode="test", appendent=(memory_data, memory_targets)
-    )
-    loader = DataLoader(dataset, batch_size=256, shuffle=False, num_workers=0)
+    # worker. Snapshot and restore every RNG, mode, frozen flag, and tensor
+    # around dataset construction and traversal.
     old_network = learner._old_network
     if old_network is None:
         raise RuntimeError("H037 requires a frozen old network on incremental tasks")
@@ -2296,9 +2293,21 @@ def _h037_snapshot(learner, data_manager):
         raise AssertionError("H037 old-network parameters must be frozen")
     mode_before = bool(old_network.training)
     rng_before = _h033_rng_snapshot()
+    state_before = {
+        name: value.detach().cpu().clone()
+        for name, value in old_base.state_dict().items()
+    }
+    frozen_before = {
+        name: bool(parameter.requires_grad)
+        for name, parameter in old_base.named_parameters()
+    }
     layer_vectors = {"layer3": [], "layer4": []}
     labels = []
     try:
+        dataset = data_manager.get_dataset(
+            [], source="train", mode="test", appendent=(memory_data, memory_targets)
+        )
+        loader = DataLoader(dataset, batch_size=256, shuffle=False, num_workers=0)
         old_network.eval()
         with torch.no_grad():
             for batch in loader:
@@ -2313,13 +2322,24 @@ def _h037_snapshot(learner, data_manager):
                 layer_vectors["layer4"].append(_h037_gap(fmaps[3]).detach())
                 labels.append(targets.to(learner._device, dtype=torch.long))
     finally:
-        if mode_before:
-            old_network.train()
-        else:
-            old_network.eval()
+        old_network.train(mode_before)
         _h033_restore_rng(rng_before)
-    if bool(old_network.training) != mode_before or not _h033_rng_equal(rng_before, _h033_rng_snapshot()):
-        raise AssertionError("H037 rehearsal snapshot did not restore mode/RNG")
+        checks = {
+            "python_numpy_torch_rng_restored": _h033_rng_equal(
+                rng_before, _h033_rng_snapshot()
+            ),
+            "old_network_mode_restored": bool(old_network.training) == mode_before,
+            "old_network_frozen_state_restored": {
+                name: bool(parameter.requires_grad)
+                for name, parameter in old_base.named_parameters()
+            } == frozen_before,
+            "old_network_state_unchanged": all(
+                torch.equal(value.detach().cpu(), state_before[name])
+                for name, value in old_base.state_dict().items()
+            ),
+        }
+        if not all(checks.values()):
+            raise AssertionError("H037 rehearsal snapshot invariance failed: {}".format(checks))
     if not labels:
         raise RuntimeError("H037 rehearsal loader yielded no rows")
     labels = torch.cat(labels, dim=0)
@@ -2536,18 +2556,25 @@ def _h037_emit_diagnostic(learner, data_manager):
         return
     if len(learner._h037_measurements) != data_manager.nb_tasks - 1:
         raise AssertionError("H037 expected one measurement for each incremental task")
-    h036_final = learner._h036_measurements[-1] if hasattr(learner, "_h036_measurements") else None
-    if h036_final is None:
+    h036_measurements = getattr(learner, "_h036_measurements", None)
+    if not h036_measurements:
         raise RuntimeError("H037 requires the final H036 measurement before emission")
-    h036_partition = h036_final["final_error_last_positive_partition"]
-    h036_last_collapse = int(h036_partition.get("layer3->layer4", 0))
-    h036_never_positive = int(h036_partition.get("never_positive", 0))
+    h036_final = h036_measurements[-1]
+    h036_partition = h036_final.get("final_error_last_positive_partition")
+    if not isinstance(h036_partition, dict):
+        raise RuntimeError("H037 final H036 measurement is missing final error partition")
+    if "layer3->layer4" not in h036_partition or "never_positive" not in h036_partition:
+        raise RuntimeError("H037 final H036 measurement is missing preregistered partitions")
+    h036_last_collapse = int(h036_partition["layer3->layer4"])
+    h036_never_positive = int(h036_partition["never_positive"])
     official_nme = float(h036_final["official_accuracy"])
+    if not 0.0 <= official_nme <= 1.0:
+        raise ValueError("H037 final H036 official NME is outside [0, 1]")
     artifact = {
         "schema": "openresearch.h037-gated-margin-preservation.v1",
         "protocol": {"model": "iCaRL", "convnet": "resnet18", "memory_size": 6000, "seed": 1993, "coefficient": _H037_MARGIN_COEFFICIENT, "snapshot_loader": "source=train; mode=test; shuffle=False; num_workers=0"},
         "preregistered_reading": {"h036_final_layer3_to_layer4_last_collapse_max": 274, "h036_never_positive_max": 478, "official_aggregate_nme_min": 0.7132166667, "capability_evaluated_externally": True},
-        "h036_engagement": {"final_layer3_to_layer4_last_collapse_count": h036_last_collapse, "never_positive_count": h036_never_positive, "target_engaged": bool(h036_last_collapse <= 274 and h036_never_positive <= 478), "official_final_task_nme": official_nme, "aggregate_nme_available": False, "capability_threshold_met": None},
+        "h036_engagement": {"final_layer3_to_layer4_last_collapse_count": h036_last_collapse, "never_positive_count": h036_never_positive, "target_engaged": bool(h036_last_collapse <= 274 and h036_never_positive <= 478), "official_final_task_nme": official_nme, "aggregate_nme_available": False, "capability_threshold_met": None, "capability_evaluated_externally": True},
         "synthetic_checks": learner._h037_synthetic_checks,
         "static_contract": learner._h037_static_contract,
         "measurements": learner._h037_measurements,
