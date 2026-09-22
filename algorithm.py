@@ -2372,6 +2372,7 @@ def _h038_static_contract_check():
     """Fail fast if H038's layer, restoration, and diagnostic contracts drift."""
     import ast
     import inspect
+    import textwrap
 
     tree = ast.parse(inspect.getsource(_h038_update_representation))
     fmap_indices = {"outputs_fmaps": set(), "old_outputs_fmaps": set()}
@@ -2396,9 +2397,63 @@ def _h038_static_contract_check():
     required_diagnostic = ("final_error_last_positive_partition", "capability_evaluated_externally")
     if any(fragment not in diagnostic_source for fragment in required_diagnostic):
         raise AssertionError("H038 diagnostic contract is missing H036/external capability fields")
+    required_task_diagnostics = (
+        "expected_task_ids = list(range(1, data_manager.nb_tasks))",
+        "len(diagnostics) != len(expected_task_ids)",
+        "sorted(observed_task_ids) != expected_task_ids",
+    )
+    if any(fragment not in diagnostic_source for fragment in required_task_diagnostics):
+        raise AssertionError("H038 diagnostic contract is missing task coverage checks")
     if "training_row_summaries" not in update_source:
         raise AssertionError("H038 training-row counts must remain nested diagnostics")
-    return {"current_feature_map_indices": [3], "teacher_feature_map_indices": [2], "final_embedding_accesses": 0, "rehearsal_rng_mode_frozen_restore": True, "h036_partition_diagnostic": True, "training_row_summaries": True}
+    install_source = inspect.getsource(_install_h038_margin_ablation)
+    install_tree = ast.parse(textwrap.dedent(install_source))
+    instrumented = next(
+        (
+            node
+            for node in ast.walk(install_tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "instrumented_incremental_train"
+        ),
+        None,
+    )
+    if instrumented is None:
+        raise AssertionError("H038 incremental-train lifecycle wrapper is missing")
+    if any(isinstance(node, ast.Try) for node in ast.walk(instrumented)):
+        raise AssertionError("H038 diagnostic wrapper must not catch training errors")
+    original_assignments = [
+        node
+        for node in instrumented.body
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "original_incremental_train"
+    ]
+    diagnostic_calls = [
+        node
+        for node in instrumented.body
+        if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "_h038_emit_diagnostic"
+    ]
+    result_returns = [
+        node
+        for node in instrumented.body
+        if isinstance(node, ast.Return)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "result"
+    ]
+    if len(original_assignments) != 1 or len(diagnostic_calls) != 1 or len(result_returns) != 1:
+        raise AssertionError("H038 diagnostic lifecycle must assign, emit, and return exactly once")
+    positions = {id(node): index for index, node in enumerate(instrumented.body)}
+    if not (
+        positions[id(original_assignments[0])]
+        < positions[id(diagnostic_calls[0])]
+        < positions[id(result_returns[0])]
+    ):
+        raise AssertionError("H038 diagnostic must emit only after successful training")
+    return {"current_feature_map_indices": [3], "teacher_feature_map_indices": [2], "final_embedding_accesses": 0, "rehearsal_rng_mode_frozen_restore": True, "h036_partition_diagnostic": True, "training_row_summaries": True, "diagnostic_after_successful_training": True, "diagnostic_wrapper_no_error_masking": True}
 
 
 def _h038_rehearsal_geometry(self):
@@ -2560,6 +2615,30 @@ def _h038_update_representation(self, train_loader, test_loader, optimizer, sche
 def _h038_emit_diagnostic(self, data_manager):
     if self._cur_task != data_manager.nb_tasks - 1:
         return
+    expected_task_ids = list(range(1, data_manager.nb_tasks))
+    diagnostics = getattr(self, "_h038_diagnostics", None)
+    if not isinstance(diagnostics, list):
+        raise RuntimeError("H038 requires a task diagnostic list before emission")
+    if len(diagnostics) != len(expected_task_ids):
+        raise RuntimeError(
+            "H038 requires exactly {} task diagnostics, got {}".format(
+                len(expected_task_ids), len(diagnostics)
+            )
+        )
+    observed_task_ids = []
+    for diagnostic in diagnostics:
+        if not isinstance(diagnostic, dict) or "task" not in diagnostic:
+            raise RuntimeError("H038 task diagnostics must include a task id")
+        task_id = diagnostic["task"]
+        if isinstance(task_id, bool) or not isinstance(task_id, int):
+            raise RuntimeError("H038 task diagnostic ids must be integers")
+        observed_task_ids.append(task_id)
+    if sorted(observed_task_ids) != expected_task_ids:
+        raise RuntimeError(
+            "H038 task diagnostics must cover incremental tasks 1..{} once each".format(
+                data_manager.nb_tasks - 1
+            )
+        )
     h036_measurements = getattr(self, "_h036_measurements", None)
     if not h036_measurements:
         raise RuntimeError("H038 requires the final H036 measurement before emission")
@@ -2574,7 +2653,6 @@ def _h038_emit_diagnostic(self, data_manager):
     official_nme = float(h036_final["official_accuracy"])
     if not 0.0 <= official_nme <= 1.0:
         raise ValueError("H038 final H036 official NME is outside [0, 1]")
-    diagnostics = getattr(self, "_h038_diagnostics", [])
     artifact = {
         "schema": "openresearch.h038-ungated-margin-ablation.v1",
         "hypothesis": "ungated replay margin preservation tests whether negative Layer3 teacher margins should be constrained toward zero",
@@ -2605,10 +2683,9 @@ def _install_h038_margin_ablation():
 
     def instrumented_incremental_train(self, data_manager):
         self._h038_data_manager = data_manager
-        try:
-            return original_incremental_train(self, data_manager)
-        finally:
-            _h038_emit_diagnostic(self, data_manager)
+        result = original_incremental_train(self, data_manager)
+        _h038_emit_diagnostic(self, data_manager)
+        return result
 
     icarl_module.iCaRL.incremental_train = instrumented_incremental_train
     icarl_module.iCaRL._update_representation = _h038_update_representation
