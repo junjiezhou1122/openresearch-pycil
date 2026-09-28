@@ -1770,6 +1770,8 @@ def _h036_select_transition(transitions, error_count, last_positive_partition=No
 
 _H039_SCHEMA = "PYCIL-O-NEXT-AGE-SAMPLE-TRANSITIONS@0.1.0-candidate"
 _H039_CHUNK_SIZE = 100
+_H039_EVAL_SPLIT = "cifar100-frozen-val"
+_H039_EXPECTED_ROWS = 3000
 
 
 def _h039_content_digest(raw):
@@ -1796,7 +1798,7 @@ def _h039_sample_id(raw, split, true_class):
 
 
 def _h039_subject_ids(raw, labels):
-    ids = [_h039_sample_id(item, "test", cls) for item, cls in zip(raw, labels)]
+    ids = [_h039_sample_id(item, _H039_EVAL_SPLIT, cls) for item, cls in zip(raw, labels)]
     if len(set(ids)) != len(ids):
         raise AssertionError("H039 raw content/label identities are not unique; fail closed")
     return ids
@@ -1820,8 +1822,8 @@ def _h039_emit(data_manager, test_labels, official_predictions, competitors,
     expected_shape = (len(_H036_LAYERS), len(labels))
     if len(raw) != len(raw_targets) or len(raw) != len(labels):
         raise RuntimeError("H039 raw test identity/order mismatch")
-    if len(labels) != 10000:
-        raise AssertionError("H039 CIFAR-100 test row count mismatch")
+    if len(labels) != _H039_EXPECTED_ROWS:
+        raise AssertionError("H039 frozen val row count mismatch")
     if not np.array_equal(raw_targets, labels):
         raise AssertionError("H039 raw test labels differ from official loader order")
     if official_predictions.shape != labels.shape or competitors.shape != labels.shape:
@@ -1871,8 +1873,8 @@ def _h039_emit(data_manager, test_labels, official_predictions, competitors,
         "protocol": {
             "originalCommit": "13d1d74a145c9a09d669da10209ed867a29c1945",
             "dataset": "cifar100",
-            "split": "test",
-            "subject_identity": "sha256(dataset,split,true_class,dtype,shape,raw_content); position excluded; duplicate content/label fails closed",
+            "split": _H039_EVAL_SPLIT,
+            "subject_identity": "sha256(dataset,frozen-evaluator-split,true_class,dtype,shape,raw_content); position excluded; duplicate content/label fails closed",
             "endpoint": "reuse exact H036 arrays; no geometry recomputation",
             "measurement_only": True,
         },
