@@ -1768,6 +1768,203 @@ def _h036_select_transition(transitions, error_count, last_positive_partition=No
     return selected["from"] + "->" + selected["to"]
 
 
+_H039_SCHEMA = "PYCIL-O-NEXT-AGE-SAMPLE-TRANSITIONS@0.1.0-candidate"
+_H039_CHUNK_SIZE = 100
+
+
+def _h039_content_digest(raw):
+    import numpy as np
+
+    array = np.ascontiguousarray(raw)
+    digest = hashlib.sha256()
+    digest.update(str(array.dtype).encode())
+    digest.update(json.dumps(list(array.shape), separators=(",", ":")).encode())
+    digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def _h039_sample_id(raw, split, true_class):
+    payload = {
+        "dataset": "cifar100",
+        "split": split,
+        "true_class": int(true_class),
+        "content_sha256": _h039_content_digest(raw),
+    }
+    return "h039-" + hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _h039_subject_ids(raw, labels):
+    ids = [_h039_sample_id(item, "test", cls) for item, cls in zip(raw, labels)]
+    if len(set(ids)) != len(ids):
+        raise AssertionError("H039 raw content/label identities are not unique; fail closed")
+    return ids
+
+
+def _h039_emit(data_manager, test_labels, official_predictions, competitors,
+               pair_margins, predictions, partition):
+    import numpy as np
+
+    class_ids = np.arange(int(np.sum(data_manager._increments)), dtype=np.int64)
+    raw, raw_targets, _ = data_manager.get_dataset(
+        class_ids, source="test", mode="test", ret_data=True
+    )
+    raw = np.asarray(raw)
+    raw_targets = np.asarray(raw_targets, dtype=np.int64)
+    labels = np.asarray(test_labels, dtype=np.int64)
+    official_predictions = np.asarray(official_predictions, dtype=np.int64)
+    competitors = np.asarray(competitors, dtype=np.int64)
+    pair_margins = np.asarray(pair_margins, dtype=np.float64)
+    predictions = np.asarray(predictions, dtype=np.int64)
+    expected_shape = (len(_H036_LAYERS), len(labels))
+    if len(raw) != len(raw_targets) or len(raw) != len(labels):
+        raise RuntimeError("H039 raw test identity/order mismatch")
+    if len(labels) != 10000:
+        raise AssertionError("H039 CIFAR-100 test row count mismatch")
+    if not np.array_equal(raw_targets, labels):
+        raise AssertionError("H039 raw test labels differ from official loader order")
+    if official_predictions.shape != labels.shape or competitors.shape != labels.shape:
+        raise RuntimeError("H039 official endpoint arrays have incompatible shapes")
+    if pair_margins.shape != expected_shape or predictions.shape != expected_shape:
+        raise RuntimeError("H039 layer arrays have incompatible shapes")
+    if not np.isfinite(pair_margins).all():
+        raise FloatingPointError("H039 layer margins are non-finite")
+    ids = _h039_subject_ids(raw, labels)
+    if ids != _h039_subject_ids(raw, labels):
+        raise AssertionError("H039 sample IDs are not repeatable")
+    errors = official_predictions != labels
+    if int(errors.sum()) != 1087:
+        raise AssertionError("H039 official error endpoint mismatch")
+    if int(partition.get("layer3->layer4", 0)) != 343 or int(partition.get("never_positive", 0)) != 456:
+        raise AssertionError("H039 H036 partition counts mismatch")
+    if not np.array_equal(predictions[-1], official_predictions):
+        raise AssertionError("H039 final layer predictions differ from official endpoint")
+    all_signs = pair_margins.T > 0.0
+    error_partition = [_h039_row_partition(all_signs[i], _H036_LAYERS) for i in np.flatnonzero(errors)]
+    recovered = {}
+    for value in error_partition:
+        recovered[value] = recovered.get(value, 0) + 1
+    if recovered != {key: int(value) for key, value in partition.items()}:
+        raise AssertionError("H039 row partitions do not reproduce H036 partition")
+    increments = np.asarray(data_manager._increments, dtype=np.int64)
+    origin_tasks = _h034_task_age_ids(labels, increments, int(np.sum(increments)))
+    final_task = len(increments) - 1
+    rows = []
+    for i in range(len(labels)):
+        rows.append({
+            "sample_id": ids[i],
+            "test_position": int(i),
+            "true_class": int(labels[i]),
+            "origin_task": int(origin_tasks[i]),
+            "task_age": int(final_task - origin_tasks[i]),
+            "official_predicted_class": int(official_predictions[i]),
+            "official_correct": bool(not errors[i]),
+            "official_competitor_class": int(competitors[i]),
+            "layer_predicted_class": {name: int(predictions[j, i]) for j, name in enumerate(_H036_LAYERS)},
+            "layer_pair_margin_sign": {name: bool(all_signs[i, j]) for j, name in enumerate(_H036_LAYERS)},
+            "layer_pair_margin": {name: float(pair_margins[j, i]) for j, name in enumerate(_H036_LAYERS)},
+            "last_positive_partition": (_h039_row_partition(all_signs[i], _H036_LAYERS) if errors[i] else None),
+        })
+    return {
+        "schema": _H039_SCHEMA,
+        "protocol": {
+            "originalCommit": "13d1d74a145c9a09d669da10209ed867a29c1945",
+            "dataset": "cifar100",
+            "split": "test",
+            "subject_identity": "sha256(dataset,split,true_class,dtype,shape,raw_content); position excluded; duplicate content/label fails closed",
+            "endpoint": "reuse exact H036 arrays; no geometry recomputation",
+            "measurement_only": True,
+        },
+        "preregistered_criteria": {
+            "supported_if": [
+                "unique and repeatable IDs",
+                "exact official errors=1087",
+                "H036 partition layer3->layer4=343 and never_positive=456",
+                "row partitions exactly reproduce H036",
+                "all invariance checks pass",
+            ],
+            "otherwise": "inconclusive/unsupported; no repair",
+        },
+        "rows": rows,
+        "row_count": int(len(rows)),
+        "official_error_count": int(errors.sum()),
+        "partition": {key: int(value) for key, value in partition.items()},
+    }
+
+
+def _h039_print_artifact(artifact):
+    rows = artifact.pop("rows")
+    canonical_rows = json.dumps(rows, sort_keys=True, separators=(",", ":"))
+    row_digest = hashlib.sha256(canonical_rows.encode()).hexdigest()
+    chunks = [rows[start:start + _H039_CHUNK_SIZE] for start in range(0, len(rows), _H039_CHUNK_SIZE)]
+    manifest = dict(artifact)
+    manifest["row_storage"] = {
+        "format": "stdout-json-chunks",
+        "chunk_marker": "H039_AGE_SAMPLE_TRANSITIONS_CHUNK_JSON",
+        "chunk_size": int(_H039_CHUNK_SIZE),
+        "chunk_count": int(len(chunks)),
+        "row_count": int(len(rows)),
+        "rows_sha256": row_digest,
+    }
+    print("H039_AGE_SAMPLE_TRANSITIONS_JSON " + json.dumps(manifest, sort_keys=True, separators=(",", ":")), flush=True)
+    for index, chunk_rows in enumerate(chunks):
+        chunk_payload = {
+            "schema": _H039_SCHEMA,
+            "chunk_index": int(index),
+            "chunk_count": int(len(chunks)),
+            "row_start": int(index * _H039_CHUNK_SIZE),
+            "row_count": int(len(chunk_rows)),
+            "rows": chunk_rows,
+        }
+        chunk_payload["chunk_sha256"] = hashlib.sha256(
+            json.dumps(chunk_rows, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        print("H039_AGE_SAMPLE_TRANSITIONS_CHUNK_JSON " + json.dumps(chunk_payload, sort_keys=True, separators=(",", ":")), flush=True)
+
+
+def _h039_row_partition(signs, layers):
+    import numpy as np
+
+    signs = np.asarray(signs, dtype=bool)
+    if signs.shape != (len(layers),):
+        raise RuntimeError("H039 row signs have incompatible shape")
+    positive = np.flatnonzero(signs)
+    if len(positive) == 0:
+        return "never_positive"
+    collapses = np.flatnonzero(signs[:-1] & ~signs[1:])
+    return "no_final_collapse" if len(collapses) == 0 else "{}->{}".format(layers[collapses[-1]], layers[collapses[-1] + 1])
+
+
+def _h039_synthetic_checks():
+    import numpy as np
+
+    raw = np.asarray([[[0, 1]], [[1, 2]], [[2, 3]]], dtype=np.uint8)
+    labels = np.asarray([0, 0, 1], dtype=np.int64)
+    ids = _h039_subject_ids(raw, labels)
+    if ids != _h039_subject_ids(raw.copy(), labels.copy()) or len(set(ids)) != 3:
+        raise AssertionError("H039 synthetic stable-ID check failed")
+    duplicate_failed = False
+    try:
+        _h039_subject_ids(np.asarray([raw[0], raw[0]]), np.asarray([0, 0]))
+    except AssertionError:
+        duplicate_failed = True
+    if not duplicate_failed:
+        raise AssertionError("H039 duplicate identity must fail closed")
+    if _h039_row_partition([True, True, True, True, False, False], _H036_LAYERS) != "layer3->layer4":
+        raise AssertionError("H039 synthetic collapse partition check failed")
+    if _h039_row_partition([False] * len(_H036_LAYERS), _H036_LAYERS) != "never_positive":
+        raise AssertionError("H039 synthetic never-positive check failed")
+    return {
+        "stable_content_ids": True,
+        "duplicate_identity_fails_closed": True,
+        "position_excluded_from_identity": True,
+        "collapse_partition": True,
+        "never_positive_partition": True,
+        "chunked_stdout_protocol": True,
+    }
+
+
 def _h036_synthetic_checks():
     import numpy as np
 
@@ -1818,6 +2015,7 @@ def _h036_record(learner, data_manager, test_vectors, test_labels, official_cent
     state_before = _h033_state_digests(learner)
     mode_before = bool(learner._network.training)
     pending_artifact = None
+    pending_h039_inputs = None
     try:
         memory_loader, memory_targets = _h036_memory_loader(learner, data_manager)
         memory_layers, observed_memory_labels = _h036_extract_layers(learner, memory_loader)
@@ -1905,6 +2103,15 @@ def _h036_record(learner, data_manager, test_vectors, test_labels, official_cent
             nonfinal = [layer_records[layer]["accuracy"] for layer in _H036_LAYERS[:-1]]
             intermediate_supported = any(value >= official_accuracy + 0.005 for value in nonfinal)
             stage_supported = transition_selection is not None
+            pending_h039_inputs = (
+                data_manager,
+                test_labels,
+                official_predictions,
+                competitors,
+                pair_margins,
+                predictions,
+                partition,
+            )
             pending_artifact = {
                 "schema": "openresearch.h036-decision-local-geometry.v1",
                 "hypothesis": "decision-local layer geometry can identify intermediate headroom or a stage-local margin collapse",
@@ -1934,6 +2141,16 @@ def _h036_record(learner, data_manager, test_vectors, test_labels, official_cent
                 raise AssertionError("H036 requires exactly six state/RNG checks")
             pending_artifact["invariance_checks"] = list(learner._h036_invariance_checks)
             print("H036_DECISION_LOCAL_GEOMETRY_JSON " + json.dumps(pending_artifact, sort_keys=True, separators=(",", ":")), flush=True)
+            if pending_h039_inputs is None:
+                raise RuntimeError("H039 final inputs were not assembled")
+            mode_restored = bool(learner._network.training) == mode_before
+            if not mode_restored:
+                raise AssertionError("H039 network mode was not restored")
+            h039_artifact = _h039_emit(*pending_h039_inputs)
+            h039_artifact["synthetic_checks"] = _h039_synthetic_checks()
+            h039_artifact["invariance_checks"] = list(learner._h036_invariance_checks)
+            h039_artifact["h039_invariance_checks"] = {"network_mode_restored": True}
+            _h039_print_artifact(h039_artifact)
 
 
 def _h033_record(learner, data_manager):
