@@ -1848,11 +1848,14 @@ def _h039_emit(data_manager, test_labels, official_predictions, competitors,
     if not np.array_equal(predictions[-1], official_predictions):
         raise AssertionError("H039 final layer predictions differ from official endpoint")
     all_signs = pair_margins.T > 0.0
-    error_partition = [_h039_row_partition(all_signs[i], _H036_LAYERS) for i in np.flatnonzero(errors)]
-    recovered = {}
-    for value in error_partition:
-        recovered[value] = recovered.get(value, 0) + 1
-    if recovered != {key: int(value) for key, value in partition.items()}:
+    expected_partition = {key: int(value) for key, value in partition.items()}
+    recovered = {key: 0 for key in expected_partition}
+    for i in np.flatnonzero(errors):
+        value = _h039_row_partition(all_signs[i], _H036_LAYERS)
+        if value not in recovered:
+            raise AssertionError("H039 row partition contains an unknown category: {}".format(value))
+        recovered[value] += 1
+    if recovered != expected_partition:
         raise AssertionError("H039 row partitions do not reproduce H036 partition")
     increments = np.asarray(data_manager._increments, dtype=np.int64)
     origin_tasks = _h034_task_age_ids(labels, increments, int(np.sum(increments)))
@@ -1976,12 +1979,19 @@ def _h039_synthetic_checks():
         raise AssertionError("H039 synthetic collapse partition check failed")
     if _h039_row_partition([False] * len(_H036_LAYERS), _H036_LAYERS) != "never_positive":
         raise AssertionError("H039 synthetic never-positive check failed")
+    expected_partition = {"layer3->layer4": 1, "never_positive": 1, "no_final_collapse": 0}
+    recovered = {key: 0 for key in expected_partition}
+    for signs in ([True, True, True, True, False, False], [False] * len(_H036_LAYERS)):
+        recovered[_h039_row_partition(signs, _H036_LAYERS)] += 1
+    if recovered != expected_partition:
+        raise AssertionError("H039 synthetic zero-count partition check failed")
     return {
         "stable_content_ids": True,
         "duplicate_identity_fails_closed": True,
         "position_excluded_from_identity": True,
         "collapse_partition": True,
         "never_positive_partition": True,
+        "zero_count_partition_keys": True,
         "chunked_stdout_protocol": True,
     }
 
